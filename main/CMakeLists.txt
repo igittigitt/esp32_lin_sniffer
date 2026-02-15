@@ -1,0 +1,21 @@
+idf_component_register(
+    SRCS
+        "lin_sniffer_main.c"
+        "ring_buffer.c"
+        "web_server.c"
+        "led_indicator.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        lin_uart
+        driver
+        esp_wifi
+        esp_event
+        nvs_flash
+        lwip
+        esp_netif
+        esp_timer
+        esp_http_server
+        app_update
+        led_strip
+)

@@ -1,0 +1,35 @@
+# ESP-IDF build artifacts
+build/
+
+# Generated SDK config (user-specific, generated from sdkconfig.defaults)
+sdkconfig
+sdkconfig.old
+sdkconfig.local
+sdkconfig.defaults.local
+
+# ESP-IDF managed components cache
+managed_components/
+dependencies.lock
+
+# Python
+__pycache__/
+*.pyc
+
+# VS Code IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# flash/ directory: only keep the merged binary, ignore build artifacts
+flash/*.elf
+flash/*.map
+# Do NOT ignore: flash/lin_sniffer_merged.bin  ← committed intentionally

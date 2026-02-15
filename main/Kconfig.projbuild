@@ -1,0 +1,83 @@
+menu "LIN Sniffer Configuration"
+
+    menu "WiFi Configuration"
+    
+        config WIFI_SSID
+            string "WiFi SSID"
+            default ""
+            help
+                SSID (network name) for the WiFi network to connect to.
+                Leave empty to use NVS credentials or console setup.
+        
+        config WIFI_PASSWORD
+            string "WiFi Password"
+            default ""
+            help
+                Password for the WiFi network.
+                Leave empty to use NVS credentials or console setup.
+        
+        config WIFI_MAXIMUM_RETRY
+            int "Maximum WiFi retry"
+            default 5
+            help
+                Maximum number of connection retry attempts.
+    
+    endmenu
+    
+    menu "LIN Configuration"
+    
+        config LIN_UART_NUM
+            int "UART port number"
+            default 1
+            range 0 2
+            help
+                UART port number for LIN bus (0, 1, or 2).
+        
+        config LIN_UART_RX_GPIO
+            int "UART RX GPIO"
+            default 4
+            range 0 48
+            help
+                GPIO pin for UART RX (LIN receive).
+        
+        config LIN_UART_TX_GPIO
+            int "UART TX GPIO"
+            default 5
+            range 0 48
+            help
+                GPIO pin for UART TX (LIN transmit).
+        
+        config LIN_BAUDRATE
+            int "LIN Baudrate"
+            default 9600
+            help
+                Baudrate for LIN bus (typically 9600 or 19200).
+        
+        config LIN_BYTE_TIMEOUT_MS
+            int "LIN byte timeout (ms)"
+            default 50
+            range 10 1000
+            help
+                Timeout in milliseconds to detect end of frame.
+    
+    endmenu
+    
+    menu "Network Configuration"
+    
+        config TCP_PORT
+            int "TCP server port"
+            default 23
+            range 21 65535
+            help
+                Port for TCP server (use with putty or netcat).
+        
+        config MAX_TCP_CLIENTS
+            int "Maximum TCP clients"
+            default 3
+            range 1 10
+            help
+                Maximum number of simultaneous TCP connections.
+    
+    endmenu
+
+endmenu
