@@ -145,7 +145,6 @@ static const char TERMINAL_HTML[] =
 "  ws.onopen=()=>{"
 "    status.className='ok';"
 "    document.getElementById('ip').textContent=location.host;"
-"    appendLine('# Verbunden','info');"
 "  };"
 "  ws.onmessage=e=>{"
 "    e.data.split('\\n').forEach(l=>{if(l.trim())appendLine(l,classForLine(l));});"
@@ -399,23 +398,16 @@ static esp_err_t handler_ws(httpd_req_t *req)
         ESP_LOGI(TAG, "WS: Client verbunden fd=%d", fd);
         ws_client_add(fd);
 
-        // Version + HELP beim WebSocket-Connect senden
-        char welcome[64];
+        // Version beim WebSocket-Connect senden
+        char welcome[128];
         snprintf(welcome, sizeof(welcome),
-                 "# LIN Sniffer v" LIN_SNIFFER_VERSION "\r\n");
-        s_ws_resp_len = 0;
-        s_ws_resp_buf[0] = '\0';
-        ws_send_shim(WS_FAKE_SOCK, welcome, strlen(welcome));
-        parse_command("HELP", WS_FAKE_SOCK);
-
-        if (s_ws_resp_len > 0) {
-            httpd_ws_frame_t pkt = {
-                .type    = HTTPD_WS_TYPE_TEXT,
-                .payload = (uint8_t *)s_ws_resp_buf,
-                .len     = s_ws_resp_len,
-            };
-            httpd_ws_send_frame(req, &pkt);
-        }
+                 "# LIN Sniffer v" LIN_SNIFFER_VERSION " (type HELP for commands)\r\n");
+        httpd_ws_frame_t pkt = {
+            .type    = HTTPD_WS_TYPE_TEXT,
+            .payload = (uint8_t *)welcome,
+            .len     = strlen(welcome),
+        };
+        httpd_ws_send_frame(req, &pkt);
 
         return ESP_OK;
     }

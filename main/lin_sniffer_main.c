@@ -469,6 +469,12 @@ static void poll_stop(void)
 void parse_command(char *cmd, int sock)
 {
     char response[256];
+    char cmd_buf[256];
+    
+    // Copy to mutable buffer (cmd might be read-only)
+    strncpy(cmd_buf, cmd, sizeof(cmd_buf) - 1);
+    cmd_buf[sizeof(cmd_buf) - 1] = '\0';
+    cmd = cmd_buf;
 
     // Remove CR/LF
     for (char *p = cmd; *p; p++) {
@@ -700,10 +706,19 @@ void parse_command(char *cmd, int sock)
 
     // HELP
     else if (strcmp(cmd, "HELP") == 0) {
-        snprintf(response, sizeof(response),
-                 "HEADER <ID> | SEND <ID> <data> | POLL <ID> <ms> [<count>|<N>s] | SLAVE <ID> <data> | FILTER <ID> [<ID>...] | STOP"
-                 " | SCAN | WIFI <SSID> <PW> | REBOOT | HELP\r\n");
-        CMD_SEND(sock, response, strlen(response));
+        const char *help_text =
+            "Available commands:\r\n"
+            "  HEADER <ID>                  - Send LIN header, listen for response\r\n"
+            "  SEND <ID> <data>             - Send complete LIN frame\r\n"
+            "  POLL <ID> <ms> [<N>|<N>s]    - Poll ID every N ms (count or duration)\r\n"
+            "  SLAVE <ID> <data>            - Simulate LIN slave response\r\n"
+            "  FILTER <ID> [<ID>...]        - Show only specified IDs\r\n"
+            "  STOP                         - Stop POLL/SLAVE/FILTER\r\n"
+            "  SCAN                         - Scan all IDs 0x00-0x3F\r\n"
+            "  WIFI <SSID> <PW>             - Set WiFi credentials and reboot\r\n"
+            "  REBOOT                       - Restart device\r\n"
+            "  HELP                         - Show this help\r\n";
+        CMD_SEND(sock, help_text, strlen(help_text));
     }
 
     else {
@@ -851,10 +866,8 @@ void tcp_server_task(void *pvParameters)
             ESP_LOGI(TAG, "Client %d connected", slot);
             char welcome[128];
             snprintf(welcome, sizeof(welcome),
-                     "# LIN Sniffer v" LIN_SNIFFER_VERSION "\r\n");
+                     "# LIN Sniffer v" LIN_SNIFFER_VERSION " (type HELP for commands)\r\n");
             send(sock, welcome, strlen(welcome), 0);
-            // HELP direkt beim Connect ausgeben
-            parse_command("HELP", sock);
             xTaskCreate(client_handler_task, "client", 4096, (void*)sock, 5, NULL);
         } else {
             close(sock);

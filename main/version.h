@@ -1,3 +1,3 @@
 #pragma once
 
-#define LIN_SNIFFER_VERSION  "1.2.0"
+#define LIN_SNIFFER_VERSION  "1.3.1"
