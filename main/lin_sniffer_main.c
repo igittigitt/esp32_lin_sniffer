@@ -133,6 +133,13 @@ static struct {
     uint8_t       data_len;
 } slave_state = {0};
 
+// ── FILTER state ──────────────────────────────────────────────────
+static struct {
+    volatile bool active;           // filter active
+    uint8_t       ids[64];          // allowed IDs (max 64 = 0x00-0x3F)
+    uint8_t       count;            // number of IDs in filter
+} filter_state = {0};
+
 // ═══════════════════════════════════════════════════════════════════
 // Prototypes
 // ═══════════════════════════════════════════════════════════════════
@@ -160,6 +167,7 @@ void    tcp_server_task(void *pvParameters);
 void    statistics_task(void *pvParameters);
 void    poll_task(void *pvParameters);
 static void slave_sim_respond(uint8_t id);
+static bool filter_check(uint8_t id);
 
 // ═══════════════════════════════════════════════════════════════════
 // Helper Functions
@@ -199,6 +207,9 @@ void lin_rx_callback(uint8_t id, const uint8_t *data, uint8_t len,
                     lin_checksum_type_t checksum_type, uint64_t timestamp_us,
                     void *user_data)
 {
+    // Filter check: skip if not in allowed list
+    if (!filter_check(id)) return;
+
     stats.total_frames++;
 
     if (data == NULL || len == 0) {
@@ -375,6 +386,20 @@ static void lin_scan_bus(uart_port_t uart_num, int sock)
         "══════════════════════════════════════════\r\n"
         "Scan abgeschlossen. %d Frame-ID(s) aktiv.\r\n\r\n", found);
     CMD_SEND(sock, line, pos);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Filter
+// ═══════════════════════════════════════════════════════════════════
+
+// Returns true if ID should be shown (no filter active OR ID is in list)
+static bool filter_check(uint8_t id)
+{
+    if (!filter_state.active) return true;
+    for (int i = 0; i < filter_state.count; i++) {
+        if (filter_state.ids[i] == id) return true;
+    }
+    return false;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -568,6 +593,38 @@ void parse_command(char *cmd, int sock)
     }
 
     // STOP
+    // FILTER <ID> [<ID> ...]
+    else if (strncmp(cmd, "FILTER ", 7) == 0) {
+        char *token = strtok(cmd + 7, " ");
+        uint8_t ids[64];
+        uint8_t count = 0;
+
+        while (token && count < 64) {
+            uint8_t id = (uint8_t)strtol(token, NULL, 16);
+            if (id > 0x3F) {
+                snprintf(response, sizeof(response), "ERROR: ID 0x%02X out of range\r\n", id);
+                CMD_SEND(sock, response, strlen(response));
+                return;
+            }
+            ids[count++] = id;
+            token = strtok(NULL, " ");
+        }
+
+        if (count == 0) {
+            snprintf(response, sizeof(response), "ERROR: FILTER <ID> [<ID> ...]\r\n");
+            CMD_SEND(sock, response, strlen(response));
+        } else {
+            // Atomic update
+            filter_state.active = false;
+            filter_state.count  = count;
+            memcpy(filter_state.ids, ids, count);
+            filter_state.active = true;
+
+            snprintf(response, sizeof(response), "FILTER active: %d ID(s)\r\n", count);
+            CMD_SEND(sock, response, strlen(response));
+        }
+    }
+
     // SLAVE <ID> <byte> [<byte> ...]
     else if (strncmp(cmd, "SLAVE ", 6) == 0) {
         char *token = strtok(cmd + 6, " ");
@@ -603,18 +660,22 @@ void parse_command(char *cmd, int sock)
     }
 
     else if (strcmp(cmd, "STOP") == 0) {
-        bool stopped_poll  = poll_state.active;
-        bool stopped_slave = slave_state.active;
+        bool stopped_poll   = poll_state.active;
+        bool stopped_slave  = slave_state.active;
+        bool stopped_filter = filter_state.active;
 
-        if (stopped_poll)  poll_stop();
-        if (stopped_slave) slave_state.active = false;
+        if (stopped_poll)   poll_stop();
+        if (stopped_slave)  slave_state.active = false;
+        if (stopped_filter) filter_state.active = false;
 
-        if (stopped_poll && stopped_slave)
-            snprintf(response, sizeof(response), "POLL and SLAVE stopped\r\n");
-        else if (stopped_poll)
-            snprintf(response, sizeof(response), "POLL stopped\r\n");
-        else if (stopped_slave)
-            snprintf(response, sizeof(response), "SLAVE sim stopped\r\n");
+        char msg[128] = "";
+        int n = 0;
+        if (stopped_poll)   n += snprintf(msg + n, sizeof(msg) - n, "POLL");
+        if (stopped_slave)  n += snprintf(msg + n, sizeof(msg) - n, "%sSLAVE", n?" and ":"");
+        if (stopped_filter) n += snprintf(msg + n, sizeof(msg) - n, "%sFILTER", n?" and ":"");
+
+        if (n > 0)
+            snprintf(response, sizeof(response), "%s stopped\r\n", msg);
         else
             snprintf(response, sizeof(response), "Nothing running\r\n");
 
@@ -666,7 +727,7 @@ void parse_command(char *cmd, int sock)
     // HELP
     else if (strcmp(cmd, "HELP") == 0) {
         snprintf(response, sizeof(response),
-                 "HEADER <ID> | SEND <ID> <data> | POLL <ID> <ms> [<count>|<N>s] | SLAVE <ID> <data> | STOP"
+                 "HEADER <ID> | SEND <ID> <data> | POLL <ID> <ms> [<count>|<N>s] | SLAVE <ID> <data> | FILTER <ID> [<ID>...] | STOP"
                  " | SCAN | WIFI <SSID> <PW> | STATUS | REBOOT | HELP\r\n");
         CMD_SEND(sock, response, strlen(response));
     }
