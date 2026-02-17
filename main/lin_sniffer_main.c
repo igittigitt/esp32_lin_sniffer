@@ -100,14 +100,6 @@ static const char *TAG = "LIN_SNIFFER";
 // Global Variables
 // ═══════════════════════════════════════════════════════════════════
 
-static struct {
-    uint32_t total_frames;
-    uint32_t valid_frames;
-    uint32_t unanswered_frames;
-    uint32_t tx_frames;
-    uint32_t errors;
-} stats = {0};
-
 static uint64_t boot_timestamp_us = 0;
 static QueueHandle_t uart_queue;
 static int client_sockets[MAX_CLIENTS];
@@ -164,7 +156,6 @@ void    parse_command(char *cmd, int sock);
 void    uart_event_task(void *pvParameters);
 void    client_handler_task(void *pvParameters);
 void    tcp_server_task(void *pvParameters);
-void    statistics_task(void *pvParameters);
 void    poll_task(void *pvParameters);
 static void slave_sim_respond(uint8_t id);
 static bool filter_check(uint8_t id);
@@ -210,17 +201,14 @@ void lin_rx_callback(uint8_t id, const uint8_t *data, uint8_t len,
     // Filter check: skip if not in allowed list
     if (!filter_check(id)) return;
 
-    stats.total_frames++;
 
     if (data == NULL || len == 0) {
-        stats.unanswered_frames++;
         char buf[64];
         double timestamp_sec = (timestamp_us - boot_timestamp_us) / 1000000.0;
         int pos = snprintf(buf, sizeof(buf), "(%.6f) lin0 %03X# # UNANSWERED\r\n",
                           timestamp_sec, id);
         broadcast_to_clients(buf, pos);
     } else {
-        stats.valid_frames++;
         led_indicator_send(LED_EVENT_LIN_RX);
         output_candump(id, data, len, checksum_type, timestamp_us, "RX");
         ESP_LOGD(TAG, "RX: ID 0x%02X, len %d", id, len);
@@ -276,7 +264,6 @@ static bool scan_request(uart_port_t uart_num, uint8_t id,
 {
     uart_flush_input(uart_num);
     lin_send_header(uart_num, id);
-    stats.tx_frames++;
     led_indicator_send(LED_EVENT_LIN_TX);
 
     vTaskDelay(pdMS_TO_TICKS(SCAN_RESPONSE_MS));
@@ -422,7 +409,6 @@ static void slave_sim_respond(uint8_t id)
     uart_write_bytes(UART_NUM, slave_state.data, slave_state.data_len);
     uart_write_bytes(UART_NUM, &checksum, 1);
 
-    stats.tx_frames++;
     led_indicator_send(LED_EVENT_LIN_TX);
 
     // Log to candump (broadcast goes via ring buffer, non-blocking)
@@ -455,7 +441,6 @@ void poll_task(void *pvParameters)
 
         lin_send_header(UART_NUM, poll_state.id);
         led_indicator_send(LED_EVENT_LIN_TX);
-        stats.tx_frames++;
         count++;
 
         vTaskDelay(pdMS_TO_TICKS(poll_state.period_ms));
@@ -508,7 +493,6 @@ void parse_command(char *cmd, int sock)
             return;
         }
         if (lin_send_header(UART_NUM, id) == ESP_OK) {
-            stats.tx_frames++;
             led_indicator_send(LED_EVENT_LIN_TX);
             snprintf(response, sizeof(response),
                      "HEADER sent for ID 0x%02X - watch for RX response\r\n", id);
@@ -532,7 +516,6 @@ void parse_command(char *cmd, int sock)
             frame.data[frame.len++] = (uint8_t)strtol(token, NULL, 16);
         }
         if (lin_send_frame(UART_NUM, &frame) == ESP_OK) {
-            stats.tx_frames++;
             led_indicator_send(LED_EVENT_LIN_TX);
             output_candump(frame.id, frame.data, frame.len,
                           frame.checksum_type, esp_timer_get_time(), "TX");
@@ -592,7 +575,6 @@ void parse_command(char *cmd, int sock)
         }
     }
 
-    // STOP
     // FILTER <ID> [<ID> ...]
     else if (strncmp(cmd, "FILTER ", 7) == 0) {
         char *token = strtok(cmd + 7, " ");
@@ -659,6 +641,7 @@ void parse_command(char *cmd, int sock)
         }
     }
 
+    // STOP
     else if (strcmp(cmd, "STOP") == 0) {
         bool stopped_poll   = poll_state.active;
         bool stopped_slave  = slave_state.active;
@@ -700,15 +683,6 @@ void parse_command(char *cmd, int sock)
         CMD_SEND(sock, response, strlen(response));
     }
 
-    // STATUS
-    else if (strcmp(cmd, "STATUS") == 0) {
-        snprintf(response, sizeof(response),
-                 "RX: %lu  TX: %lu  Valid: %lu  Unanswered: %lu\r\n",
-                 stats.total_frames, stats.tx_frames, stats.valid_frames,
-                 stats.unanswered_frames);
-        CMD_SEND(sock, response, strlen(response));
-    }
-
     // REBOOT
     else if (strcmp(cmd, "REBOOT") == 0) {
         snprintf(response, sizeof(response), "Rebooting...\r\n");
@@ -728,7 +702,7 @@ void parse_command(char *cmd, int sock)
     else if (strcmp(cmd, "HELP") == 0) {
         snprintf(response, sizeof(response),
                  "HEADER <ID> | SEND <ID> <data> | POLL <ID> <ms> [<count>|<N>s] | SLAVE <ID> <data> | FILTER <ID> [<ID>...] | STOP"
-                 " | SCAN | WIFI <SSID> <PW> | STATUS | REBOOT | HELP\r\n");
+                 " | SCAN | WIFI <SSID> <PW> | REBOOT | HELP\r\n");
         CMD_SEND(sock, response, strlen(response));
     }
 
@@ -888,14 +862,7 @@ void tcp_server_task(void *pvParameters)
     }
 }
 
-void statistics_task(void *pvParameters)
-{
-    while(1) {
-        vTaskDelay(pdMS_TO_TICKS(30000));
-        ESP_LOGI(TAG, "Stats: RX:%lu TX:%lu Valid:%lu",
-                 stats.total_frames, stats.tx_frames, stats.valid_frames);
-    }
-}
+
 
 // ═══════════════════════════════════════════════════════════════════
 // WiFi
@@ -1071,7 +1038,6 @@ void app_main(void)
     ESP_LOGI(TAG, "LIN UART ready");
 
     xTaskCreate(uart_event_task, "uart",  4096, NULL, 12, NULL);
-    xTaskCreate(statistics_task, "stats", 2048, NULL,  3, NULL);
 
     wifi_init();
 
