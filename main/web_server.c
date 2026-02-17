@@ -13,6 +13,7 @@
 #include "web_server.h"
 #include "ring_buffer.h"
 #include "lin_uart.h"
+#include "version.h"
 
 #include "esp_http_server.h"
 #include "esp_ota_ops.h"
@@ -32,32 +33,23 @@ static httpd_handle_t s_server = NULL;
 // ── Forward-Deklaration (in lin_sniffer_main.c definiert) ────────
 extern void parse_command(char *cmd, int sock);
 
-// Pseudo-Socket-FD für WebSocket-Clients im parse_command()
-// Wir leiten Antworten über einen dedizierten Puffer um — siehe unten.
 #define WS_FAKE_SOCK  (-2)
 
 // ── WebSocket Client-Liste ───────────────────────────────────────
 #define WS_MAX_CLIENTS  4
 
 static struct {
-    int      fd;              // httpd socket fd, -1 = leer
-    ringbuf_reader_t reader;  // Leseposition im Ring-Buffer
+    int      fd;
+    ringbuf_reader_t reader;
 } s_ws_clients[WS_MAX_CLIENTS];
 
 static SemaphoreHandle_t s_ws_mutex = NULL;
 
 // ── Antwort-Puffer für parse_command() via WebSocket ─────────────
-// parse_command() schreibt mit send(sock, ...) — wir fangen das ab
-// indem wir WS_FAKE_SOCK als FD übergeben und den Output puffern.
-// Für die WebSocket-Version wrappen wir parse_command() neu.
-
 static char   s_ws_resp_buf[512];
 static int    s_ws_resp_len = 0;
-static int    s_ws_resp_target_fd = -1;  // Ziel-WS-FD für Antwort
+static int    s_ws_resp_target_fd = -1;
 
-// Ersatz-send() der in den WS-Antwortpuffer schreibt.
-// Wird nur aus ws_command_handler() Kontext genutzt (kein Mutex nötig,
-// da httpd pro-Socket serialisiert).
 int ws_send_shim(int fd, const void *data, size_t len)
 {
     (void)fd;
@@ -70,8 +62,6 @@ int ws_send_shim(int fd, const void *data, size_t len)
 }
 
 // ── Terminal HTML ─────────────────────────────────────────────────
-// Inline als C-String. Minimales aber funktionales UI.
-// Kein externes Framework — rein vanilla JS + CSS.
 
 static const char TERMINAL_HTML[] =
 "<!DOCTYPE html><html lang='de'><head>"
@@ -85,6 +75,7 @@ static const char TERMINAL_HTML[] =
 "#header h1{font-size:14px;font-weight:600;color:#fff}"
 "#status{width:8px;height:8px;border-radius:50%;background:#f44}"
 "#status.ok{background:#4caf50}"
+"#version{margin-left:auto;color:#666;font-size:11px}"
 "#log{flex:1;overflow-y:auto;padding:8px 12px;font-size:12px}"
 ".rx{color:#9cdcfe}.tx{color:#dcdcaa}.err{color:#f44747}.info{color:#6a9955}.sys{color:#c586c0}"
 "#inputbar{display:flex;gap:6px;padding:8px;background:#252526;border-top:1px solid #333}"
@@ -95,13 +86,22 @@ static const char TERMINAL_HTML[] =
 "#otabar{display:flex;gap:6px;padding:6px 8px;background:#1e1e1e;border-top:1px solid #333;align-items:center}"
 "#otabar label{color:#888;font-size:11px}"
 "#otafile{color:#888;font-size:11px}"
-"#otaprog{display:none;flex:1;height:6px;background:#333;border-radius:3px;overflow:hidden}"
-"#otafill{height:100%;width:0;background:#007acc;transition:width .2s}"
+"#otaprog{display:none;flex:1;height:8px;background:#333;border-radius:4px;overflow:hidden}"
+/* Pole-Animation: heller Streifen wandert von links nach rechts */
+"@keyframes pole{0%{background-position:0 0}100%{background-position:40px 0}}"
+"#otafill{height:100%;width:0%;background:#4caf50;transition:width .3s ease}"
+"#otafill.indeterminate{"
+"  width:100%!important;"
+"  background:repeating-linear-gradient(90deg,#4caf50 0,#4caf50 20px,#66bb6a 20px,#66bb6a 40px);"
+"  background-size:40px 100%;"
+"  animation:pole .5s linear infinite"
+"}"
 "</style></head><body>"
 "<div id='header'>"
 "  <div id='status'></div>"
 "  <h1>LIN Sniffer</h1>"
 "  <span id='ip' style='color:#888;font-size:11px'></span>"
+"  <span id='version'>v" LIN_SNIFFER_VERSION "</span>"
 "</div>"
 "<div id='log'></div>"
 "<div id='inputbar'>"
@@ -132,7 +132,7 @@ static const char TERMINAL_HTML[] =
 ""
 "function classForLine(l){"
 "  if(l.includes('# RX'))return 'rx';"
-"  if(l.includes('# TX'))return 'tx';"
+"  if(l.includes('# TX')||l.includes('# SIM'))return 'tx';"
 "  if(l.includes('UNANSWERED'))return 'err';"
 "  if(l.includes('ERROR'))return 'err';"
 "  if(l.startsWith('#'))return 'info';"
@@ -177,29 +177,83 @@ static const char TERMINAL_HTML[] =
 "  autoScroll=log.scrollTop+log.clientHeight>=log.scrollHeight-20;"
 "});"
 ""
-"async function startOta(){"
+/* OTA mit XHR für echten Upload-Fortschritt */
+"function startOta(){"
 "  const f=document.getElementById('otafile').files[0];"
 "  if(!f){alert('Bitte .bin-Datei wählen');return;}"
 "  const prog=document.getElementById('otaprog');"
 "  const fill=document.getElementById('otafill');"
 "  const st=document.getElementById('otastatus');"
+""
 "  prog.style.display='block';"
+"  fill.style.width='0%';"
+"  fill.classList.remove('indeterminate');"
 "  st.textContent='Uploading...';"
-"  try{"
-"    const resp=await fetch('/ota',{method:'POST',body:f,"
-"      headers:{'Content-Type':'application/octet-stream'}});"
-"    if(resp.ok){"
-"      fill.style.width='100%';"
-"      st.textContent='OK — Reboot...';"
-"      appendLine('# OTA erfolgreich, Neustart...','info');"
-"    }else{"
-"      st.textContent='Fehler: '+resp.status;"
-"      appendLine('# OTA Fehler: '+resp.status,'err');"
+""
+"  const xhr=new XMLHttpRequest();"
+""
+/* Upload-Fortschritt: Browser weiß wieviel er gesendet hat */
+"  xhr.upload.onprogress=function(e){"
+"    if(e.lengthComputable){"
+"      const pct=Math.round(e.loaded/e.total*100);"
+"      fill.style.width=pct+'%';"
+"      st.textContent='Uploading... '+pct+'%';"
 "    }"
-"  }catch(e){"
+"  };"
+""
+/* Upload fertig → ESP32 flasht jetzt → Pole-Animation */
+"  xhr.upload.onload=function(){"
+"    fill.classList.add('indeterminate');"
+"    st.textContent='Flashing...';"
+"    appendLine('# OTA: Upload abgeschlossen, flashe...','info');"
+"  };"
+""
+"  xhr.onload=function(){"
+"    fill.classList.remove('indeterminate');"
+"    fill.style.width='100%';"
+"    if(xhr.status===200){"
+"      st.textContent='OK — Neustart...';"
+"      appendLine('# OTA erfolgreich — warte auf Neustart...','info');"
+/* Nach Reboot: Seite neu laden sobald Server wieder antwortet */
+"      waitForReboot();"
+"    }else{"
+"      st.textContent='Fehler: '+xhr.status;"
+"      appendLine('# OTA Fehler: '+xhr.status,'err');"
+"    }"
+"  };"
+""
+"  xhr.onerror=function(){"
+"    fill.classList.remove('indeterminate');"
 "    st.textContent='Upload-Fehler';"
-"    appendLine('# OTA Upload-Fehler: '+e,'err');"
-"  }"
+"    appendLine('# OTA Upload-Fehler','err');"
+"  };"
+""
+"  xhr.open('POST','/ota');"
+"  xhr.setRequestHeader('Content-Type','application/octet-stream');"
+"  xhr.send(f);"
+"}"
+""
+/* Polling bis ESP32 nach Reboot wieder antwortet, dann reload */
+"function waitForReboot(){"
+"  const st=document.getElementById('otastatus');"
+"  let attempts=0;"
+"  const max=30;"  /* max 30s warten */
+"  const timer=setInterval(async()=>{"
+"    attempts++;"
+"    st.textContent='Warte auf Neustart... ('+attempts+'s)';"
+"    try{"
+"      const r=await fetch('/',{method:'HEAD',cache:'no-store'});"
+"      if(r.ok){"
+"        clearInterval(timer);"
+"        appendLine('# Gerät neu gestartet — lade Seite...','info');"
+"        setTimeout(()=>location.reload(),500);"
+"      }"
+"    }catch(e){ /* noch nicht erreichbar, weiter warten */ }"
+"    if(attempts>=max){"
+"      clearInterval(timer);"
+"      st.textContent='Timeout — bitte manuell neu laden';"
+"    }"
+"  },1000);"
 "}"
 ""
 "connect();"
@@ -209,8 +263,7 @@ static const char TERMINAL_HTML[] =
 
 static esp_err_t handler_root(httpd_req_t *req)
 {
-    ESP_LOGI(TAG, "GET / ");
-
+    ESP_LOGI(TAG, "GET /");
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     return httpd_resp_send(req, TERMINAL_HTML, strlen(TERMINAL_HTML));
@@ -242,8 +295,7 @@ static esp_err_t handler_ota(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    // Firmware in 4KB-Chunks einlesen
-    char   *buf = malloc(4096);
+    char *buf = malloc(4096);
     if (!buf) {
         esp_ota_abort(ota_handle);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
@@ -251,11 +303,11 @@ static esp_err_t handler_ota(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    int total = 0;
+    int total     = 0;
     int remaining = req->content_len;
 
     while (remaining > 0) {
-        int to_read = (remaining < 4096) ? remaining : 4096;
+        int to_read  = (remaining < 4096) ? remaining : 4096;
         int received = httpd_req_recv(req, buf, to_read);
 
         if (received <= 0) {
@@ -304,7 +356,6 @@ static esp_err_t handler_ota(httpd_req_t *req)
     ESP_LOGI(TAG, "OTA erfolgreich (%d bytes) — Reboot...", total);
     httpd_resp_sendstr(req, "OK");
 
-    // Kurz warten damit Response den Browser erreicht
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
 
@@ -319,7 +370,6 @@ static void ws_client_add(int fd)
     for (int i = 0; i < WS_MAX_CLIENTS; i++) {
         if (s_ws_clients[i].fd == -1) {
             s_ws_clients[i].fd = fd;
-            // Letzten 50 Einträge als History anzeigen
             ringbuf_reader_init_from_history(&s_ws_clients[i].reader, 50);
             ESP_LOGI(TAG, "WS Client %d verbunden (slot %d)", fd, i);
             break;
@@ -343,33 +393,44 @@ static void ws_client_remove(int fd)
 
 static esp_err_t handler_ws(httpd_req_t *req)
 {
-    ESP_LOGI(TAG, "handler_ws aufgerufen, method=%d, HTTP_GET=%d", req->method, HTTP_GET);
-
     int fd = httpd_req_to_sockfd(req);
 
-    // Handshake (GET → 101 Switching Protocols)
     if (req->method == HTTP_GET) {
         ESP_LOGI(TAG, "WS: Client verbunden fd=%d", fd);
         ws_client_add(fd);
+
+        // Version + HELP beim WebSocket-Connect senden
+        char welcome[64];
+        snprintf(welcome, sizeof(welcome),
+                 "# LIN Sniffer v" LIN_SNIFFER_VERSION "\r\n");
+        s_ws_resp_len = 0;
+        s_ws_resp_buf[0] = '\0';
+        ws_send_shim(WS_FAKE_SOCK, welcome, strlen(welcome));
+        parse_command("HELP", WS_FAKE_SOCK);
+
+        if (s_ws_resp_len > 0) {
+            httpd_ws_frame_t pkt = {
+                .type    = HTTPD_WS_TYPE_TEXT,
+                .payload = (uint8_t *)s_ws_resp_buf,
+                .len     = s_ws_resp_len,
+            };
+            httpd_ws_send_frame(req, &pkt);
+        }
+
         return ESP_OK;
     }
-
-    ESP_LOGI(TAG, "WS: Frame empfangen fd=%d", fd);
 
     // Daten-Frame empfangen
     httpd_ws_frame_t ws_pkt;
     memset(&ws_pkt, 0, sizeof(ws_pkt));
     ws_pkt.type = HTTPD_WS_TYPE_TEXT;
 
-    // Länge ermitteln
     esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 0);
-    ESP_LOGI(TAG, "WS: recv_frame(len) ret=%d len=%d", ret, ws_pkt.len);
     if (ret != ESP_OK || ws_pkt.len == 0) {
         ws_client_remove(fd);
         return ret;
     }
 
-    // Payload lesen
     uint8_t *buf = calloc(ws_pkt.len + 1, 1);
     if (!buf) return ESP_ERR_NO_MEM;
 
@@ -381,22 +442,14 @@ static esp_err_t handler_ws(httpd_req_t *req)
         return ret;
     }
 
-    // Befehl verarbeiten
-    // parse_command() erwartet mutablen char* und nutzt send(sock,...)
-    // Wir puffern die Antwort über den shim und senden sie per WS zurück.
     s_ws_resp_len = 0;
     s_ws_resp_buf[0] = '\0';
     s_ws_resp_target_fd = fd;
 
-    // parse_command() mit WS_FAKE_SOCK aufrufen.
-    // ACHTUNG: parse_command() ruft send(sock,...) auf — das würde
-    // hier fehlschlagen. Stattdessen patchen wir den Aufruf über
-    // einen Wrapper (siehe lin_sniffer_main.c Anpassung).
     parse_command((char *)buf, WS_FAKE_SOCK);
 
     free(buf);
 
-    // Antwort zurück per WebSocket senden (falls vorhanden)
     if (s_ws_resp_len > 0) {
         httpd_ws_frame_t resp = {
             .type    = HTTPD_WS_TYPE_TEXT,
@@ -445,7 +498,6 @@ static void ws_push_task(void *pvParameters)
 
         xSemaphoreGive(s_ws_mutex);
 
-        // Wenn nichts zu senden war: kurz schlafen
         vTaskDelay(pdMS_TO_TICKS(any_sent ? 10 : 20));
     }
 }
@@ -454,7 +506,6 @@ static void ws_push_task(void *pvParameters)
 
 void web_server_start(void)
 {
-    // Client-Liste initialisieren
     s_ws_mutex = xSemaphoreCreateMutex();
     for (int i = 0; i < WS_MAX_CLIENTS; i++) {
         s_ws_clients[i].fd = -1;
@@ -462,11 +513,11 @@ void web_server_start(void)
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = 80;
-    cfg.max_open_sockets = WS_MAX_CLIENTS + 2;   // +2 für HTTP-Requests
+    cfg.max_open_sockets = WS_MAX_CLIENTS + 2;
     cfg.lru_purge_enable = true;
-    cfg.stack_size         = 8192; // default was 4096
-    cfg.max_uri_handlers   = 8;      // Standard ist 8, explizit setzen
-    cfg.recv_wait_timeout  = 10;     // Sekunden
+    cfg.stack_size         = 8192;
+    cfg.max_uri_handlers   = 8;
+    cfg.recv_wait_timeout  = 10;
     cfg.send_wait_timeout  = 10;
 
     if (httpd_start(&s_server, &cfg) != ESP_OK) {
@@ -474,7 +525,6 @@ void web_server_start(void)
         return;
     }
 
-    // Route: GET /
     static const httpd_uri_t uri_root = {
         .uri     = "/",
         .method  = HTTP_GET,
@@ -482,7 +532,6 @@ void web_server_start(void)
     };
     httpd_register_uri_handler(s_server, &uri_root);
 
-    // Route: POST /ota
     static const httpd_uri_t uri_ota = {
         .uri     = "/ota",
         .method  = HTTP_POST,
@@ -490,7 +539,6 @@ void web_server_start(void)
     };
     httpd_register_uri_handler(s_server, &uri_ota);
 
-    // Route: GET /ws  (WebSocket)
     static const httpd_uri_t uri_ws = {
         .uri          = "/ws",
         .method       = HTTP_GET,
@@ -500,10 +548,9 @@ void web_server_start(void)
     };
     httpd_register_uri_handler(s_server, &uri_ws);
 
-    // Push-Task starten
     xTaskCreate(ws_push_task, "ws_push", 4096, NULL, 4, NULL);
 
-    ESP_LOGI(TAG, "Webserver gestartet auf Port 80");
+    ESP_LOGI(TAG, "Webserver v" LIN_SNIFFER_VERSION " gestartet auf Port 80");
 }
 
 void web_server_stop(void)

@@ -26,6 +26,7 @@
 #include "driver/uart.h"
 
 #include "lin_uart.h"
+#include "version.h"
 #include "ring_buffer.h"
 #include "web_server.h"
 #include "led_indicator.h"
@@ -124,6 +125,14 @@ static struct {
     int           sock;         // client socket for status messages
 } poll_state = {0};
 
+// ── SLAVE simulation state ────────────────────────────────────────
+static struct {
+    volatile bool active;           // simulation running
+    uint8_t       id;               // LIN ID to respond to
+    uint8_t       data[LIN_MAX_DATA_LEN];
+    uint8_t       data_len;
+} slave_state = {0};
+
 // ═══════════════════════════════════════════════════════════════════
 // Prototypes
 // ═══════════════════════════════════════════════════════════════════
@@ -150,6 +159,7 @@ void    client_handler_task(void *pvParameters);
 void    tcp_server_task(void *pvParameters);
 void    statistics_task(void *pvParameters);
 void    poll_task(void *pvParameters);
+static void slave_sim_respond(uint8_t id);
 
 // ═══════════════════════════════════════════════════════════════════
 // Helper Functions
@@ -368,6 +378,34 @@ static void lin_scan_bus(uart_port_t uart_num, int sock)
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Slave Simulation
+// ═══════════════════════════════════════════════════════════════════
+
+// Called directly from uart_event_task when a matching PID is seen.
+// Runs at high priority with minimal latency - no FreeRTOS calls.
+static void slave_sim_respond(uint8_t id)
+{
+    if (!slave_state.active || id != slave_state.id) return;
+
+    // Calculate checksum (enhanced preferred, falls back to classic)
+    uint8_t pid      = lin_calculate_pid(id);
+    uint8_t checksum = lin_checksum_enhanced(pid,
+                                             slave_state.data,
+                                             slave_state.data_len);
+
+    // Send data bytes + checksum directly via UART (no delay between bytes)
+    uart_write_bytes(UART_NUM, slave_state.data, slave_state.data_len);
+    uart_write_bytes(UART_NUM, &checksum, 1);
+
+    stats.tx_frames++;
+    led_indicator_send(LED_EVENT_LIN_TX);
+
+    // Log to candump (broadcast goes via ring buffer, non-blocking)
+    output_candump(id, slave_state.data, slave_state.data_len,
+                   LIN_CHECKSUM_ENHANCED, esp_timer_get_time(), "SIM");
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // POLL Task
 // ═══════════════════════════════════════════════════════════════════
 
@@ -530,13 +568,56 @@ void parse_command(char *cmd, int sock)
     }
 
     // STOP
-    else if (strcmp(cmd, "STOP") == 0) {
-        if (poll_state.active) {
-            poll_stop();
-            snprintf(response, sizeof(response), "POLL stopped\r\n");
+    // SLAVE <ID> <byte> [<byte> ...]
+    else if (strncmp(cmd, "SLAVE ", 6) == 0) {
+        char *token = strtok(cmd + 6, " ");
+        if (!token) {
+            snprintf(response, sizeof(response), "ERROR: SLAVE <ID> <byte> ...\r\n");
+            CMD_SEND(sock, response, strlen(response));
         } else {
-            snprintf(response, sizeof(response), "No POLL running\r\n");
+            uint8_t id  = (uint8_t)strtol(token, NULL, 16);
+            uint8_t len = 0;
+            uint8_t data[LIN_MAX_DATA_LEN];
+
+            while ((token = strtok(NULL, " ")) != NULL && len < LIN_MAX_DATA_LEN) {
+                data[len++] = (uint8_t)strtol(token, NULL, 16);
+            }
+
+            if (id > 0x3F) {
+                snprintf(response, sizeof(response), "ERROR: ID must be 0x00-0x3F\r\n");
+            } else if (len == 0) {
+                snprintf(response, sizeof(response), "ERROR: at least 1 data byte required\r\n");
+            } else {
+                // Activate - atomic update
+                slave_state.active   = false;  // pause before update
+                slave_state.id       = id;
+                slave_state.data_len = len;
+                memcpy(slave_state.data, data, len);
+                slave_state.active   = true;
+
+                snprintf(response, sizeof(response),
+                         "SLAVE sim active: ID=0x%02X, %d byte(s)\r\n", id, len);
+            }
+            CMD_SEND(sock, response, strlen(response));
         }
+    }
+
+    else if (strcmp(cmd, "STOP") == 0) {
+        bool stopped_poll  = poll_state.active;
+        bool stopped_slave = slave_state.active;
+
+        if (stopped_poll)  poll_stop();
+        if (stopped_slave) slave_state.active = false;
+
+        if (stopped_poll && stopped_slave)
+            snprintf(response, sizeof(response), "POLL and SLAVE stopped\r\n");
+        else if (stopped_poll)
+            snprintf(response, sizeof(response), "POLL stopped\r\n");
+        else if (stopped_slave)
+            snprintf(response, sizeof(response), "SLAVE sim stopped\r\n");
+        else
+            snprintf(response, sizeof(response), "Nothing running\r\n");
+
         CMD_SEND(sock, response, strlen(response));
     }
 
@@ -585,7 +666,7 @@ void parse_command(char *cmd, int sock)
     // HELP
     else if (strcmp(cmd, "HELP") == 0) {
         snprintf(response, sizeof(response),
-                 "HEADER <ID> | SEND <ID> <data> | POLL <ID> <ms> [<count>|<N>s] | STOP"
+                 "HEADER <ID> | SEND <ID> <data> | POLL <ID> <ms> [<count>|<N>s] | SLAVE <ID> <data> | STOP"
                  " | SCAN | WIFI <SSID> <PW> | STATUS | REBOOT | HELP\r\n");
         CMD_SEND(sock, response, strlen(response));
     }
@@ -609,13 +690,33 @@ void uart_event_task(void *pvParameters)
     lin_parser_init(&parser);
     ESP_LOGI(TAG, "UART task started");
 
+    // Lightweight slave-sim state machine (runs in parallel to main parser)
+    // States: 0=wait_break, 1=wait_sync, 2=wait_pid
+    uint8_t sim_state = 0;
+
     while(1) {
         if (xQueueReceive(uart_queue, &event, pdMS_TO_TICKS(10))) {
             if (event.type == UART_DATA) {
                 int len = uart_read_bytes(UART_NUM, rx_buf, event.size,
                                           10 / portTICK_PERIOD_MS);
                 for (int i = 0; i < len; i++) {
-                    lin_parser_parse_byte(&parser, rx_buf[i], lin_rx_callback, NULL);
+                    uint8_t b = rx_buf[i];
+
+                    // ── Slave-sim mini state machine ─────────────
+                    // Runs independently, responds immediately on PID
+                    switch (sim_state) {
+                        case 0: if (b == 0x00) sim_state = 1; break;
+                        case 1: sim_state = (b == 0x55) ? 2 : 0; break;
+                        case 2:
+                            if (lin_check_pid_parity(b)) {
+                                slave_sim_respond(lin_get_id_from_pid(b));
+                            }
+                            sim_state = 0;
+                            break;
+                    }
+
+                    // ── Main parser (candump output) ─────────────
+                    lin_parser_parse_byte(&parser, b, lin_rx_callback, NULL);
                 }
             } else if (event.type == UART_FIFO_OVF || event.type == UART_BUFFER_FULL) {
                 ESP_LOGW(TAG, "UART overflow");
@@ -713,8 +814,12 @@ void tcp_server_task(void *pvParameters)
             client_sockets[slot] = sock;
             if (slot >= client_count) client_count = slot + 1;
             ESP_LOGI(TAG, "Client %d connected", slot);
-            const char *welcome = "# LIN Sniffer - Type HELP\r\n";
+            char welcome[128];
+            snprintf(welcome, sizeof(welcome),
+                     "# LIN Sniffer v" LIN_SNIFFER_VERSION "\r\n");
             send(sock, welcome, strlen(welcome), 0);
+            // HELP direkt beim Connect ausgeben
+            parse_command("HELP", sock);
             xTaskCreate(client_handler_task, "client", 4096, (void*)sock, 5, NULL);
         } else {
             close(sock);

@@ -82,19 +82,18 @@ Configurable options are:
 
 # Command Reference
 
+Connect via Telnet on port 23 (default) using any terminal-program (e.g. PuTTY), or open any Web-Browser at http://<IP-OF-SNIFFER> and use the command-inputfield to issue one of the following commands:
+
 - HEADER <ID>
 - SEND <ID> <data>
 - POLL <ID> <ms> [<count>|<N>s]
+- SLAVE <ID> <data>
 - STOP
 - SCAN
 - WIFI <SSID> <PW>
 - STATUS
 - REBOOT
 - HELP
-
-Connect via Telnet on port 23 (default) using any terminal-program (e.g. PuTTY)
-
----
 
 ## Commands
 
@@ -215,12 +214,52 @@ REBOOT
 
 ---
 
+### `SLAVE <ID> <byte> [<byte> ...]`
+Activates LIN slave simulation. Once enabled, the sniffer listens for the specified frame ID on the bus (sent by the BCM/master) and immediately responds with the given data bytes. Checksum is calculated automatically (Enhanced). Simulation runs until `STOP` is issued or a new `SLAVE` command replaces it.
+
+```
+SLAVE 05 A1 B2 C3 D4
+→ SLAVE sim active: ID=0x05, 4 byte(s)
+→ (1.500000) lin0 005#A1B2C3D4 # SIM Enhanced
+→ (1.700000) lin0 005#A1B2C3D4 # SIM Enhanced
+...
+```
+
+Replace the response without stopping first:
+```
+SLAVE 05 FF 00 00 00
+→ SLAVE sim active: ID=0x05, 4 byte(s)
+```
+
+> ⚠️ Response timing depends on FreeRTOS scheduling (~0.5–2 ms after PID). Whether the master accepts the response depends on its timeout window.
+
+---
+
+### `STOP`
+Stops a running `POLL` or `SLAVE` simulation (or both if both are active).
+
+```
+STOP
+→ SLAVE sim stopped
+
+STOP
+→ POLL stopped
+
+STOP
+→ POLL and SLAVE stopped
+
+STOP
+→ Nothing running
+```
+
+---
+
 ### `HELP`
 Prints a one-line command summary.
 
 ```
 HELP
-→ HEADER <ID> | SEND <ID> <data> | POLL <ID> <ms> [<count>|<N>s] | STOP | SCAN | WIFI <SSID> <PW> | STATUS | REBOOT | HELP
+→ HEADER <ID> | SEND <ID> <data> | POLL <ID> <ms> [<count>|<N>s] | SLAVE <ID> <data> | STOP | SCAN | WIFI <SSID> <PW> | STATUS | REBOOT | HELP
 ```
 
 ---
@@ -231,6 +270,7 @@ HELP
 - Commands are **case-insensitive** (`poll 25 100` = `POLL 25 100`).
 - Output is in **candump format**: `(timestamp) lin0 ID#DATA # label checksumtype`
 - Unanswered frames are shown as: `(timestamp) lin0 ID# # UNANSWERED`
+- Slave simulation output is labeled `SIM`: `(timestamp) lin0 ID#DATA # SIM Enhanced`
 - Telnet IAC negotiation bytes are filtered automatically.
 
 # Licence
