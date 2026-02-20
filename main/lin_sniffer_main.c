@@ -144,7 +144,10 @@ typedef enum {
 static struct {
     volatile bool active;
     log_format_t  format;
-} log_state = {0};
+} log_state = {
+    .active = false,
+    .format = LOG_FORMAT_HUMAN  // Default format
+};
 
 // ═══════════════════════════════════════════════════════════════════
 // Prototypes
@@ -184,30 +187,30 @@ void broadcast_to_clients(const char *message, int len)
     ringbuf_push(message);
 }
 
-void output_frame(uint8_t id, const uint8_t *data, uint8_t len,
-                 lin_checksum_type_t checksum_type, uint64_t timestamp_us,
-                 const char *label)
+
+// Format a frame according to log_state.format, write to buffer
+static int format_frame(char *buf, size_t buf_size, uint8_t id, 
+                       const uint8_t *data, uint8_t len,
+                       lin_checksum_type_t checksum_type, 
+                       uint64_t timestamp_us, const char *label)
 {
-    if (!log_state.active) return;  // Logging disabled
-    
-    char buf[128];
     int pos = 0;
 
     if (log_state.format == LOG_FORMAT_CANDUMP) {
-        // candump format: (timestamp) lin0 ID#DATA # label checksum
+        // candump format
         double timestamp_sec = (timestamp_us - boot_timestamp_us) / 1000000.0;
-        pos = snprintf(buf, sizeof(buf), "(%.6f) lin0 %03X#", timestamp_sec, id);
+        pos = snprintf(buf, buf_size, "(%.6f) lin0 %03X#", timestamp_sec, id);
 
         if (data && len > 0) {
             for (int i = 0; i < len; i++) {
-                pos += snprintf(buf + pos, sizeof(buf) - pos, "%02X", data[i]);
+                pos += snprintf(buf + pos, buf_size - pos, "%02X", data[i]);
             }
             const char *chk_type = (checksum_type == LIN_CHECKSUM_CLASSIC) ? "Classic" : "Enhanced";
-            pos += snprintf(buf + pos, sizeof(buf) - pos, " # %s %s", label, chk_type);
+            pos += snprintf(buf + pos, buf_size - pos, " # %s %s", label, chk_type);
         } else {
-            pos += snprintf(buf + pos, sizeof(buf) - pos, " # UNANSWERED");
+            pos += snprintf(buf + pos, buf_size - pos, " # UNANSWERED");
         }
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "\r\n");
+        pos += snprintf(buf + pos, buf_size - pos, "\r\n");
         
     } else {  // LOG_FORMAT_HUMAN
         // Human format: ID | Data Bytes                      CRC | ASCII    |
@@ -235,12 +238,25 @@ void output_frame(uint8_t id, const uint8_t *data, uint8_t len,
             snprintf(data_str, sizeof(data_str), "%-24s", "UNANSWERED");
         }
         
-        pos = snprintf(buf, sizeof(buf), "%02X | %s %s | %-8s |\r\n",
+        pos = snprintf(buf, buf_size, "%02X | %s %s | %-8s |\r\n",
                       id, data_str, crc_str, ascii_str);
     }
+    
+    return pos;
+}
 
+void output_frame(uint8_t id, const uint8_t *data, uint8_t len,
+                 lin_checksum_type_t checksum_type, uint64_t timestamp_us,
+                 const char *label)
+{
+    if (!log_state.active) return;  // Logging disabled
+    
+    char buf[128];
+    int pos = format_frame(buf, sizeof(buf), id, data, len, checksum_type, timestamp_us, label);
     broadcast_to_clients(buf, pos);
 }
+
+
 
 // ═══════════════════════════════════════════════════════════════════
 // LIN RX Callback
@@ -341,31 +357,30 @@ static void lin_scan_bus(uart_port_t uart_num, int sock)
     scan_active = true;  // Disable candump output during scan
 
     pos = snprintf(line, sizeof(line), "\r\n+++ LIN Bus Scan  (0x00 - 0x3F) +++\r\n");
-    CMD_SEND(sock, line, pos);
+    broadcast_to_clients(line, pos);
 
     for (uint8_t id = 0x00; id <= 0x3F; id++) {
         uint8_t buf[LIN_MAX_DATA_LEN + 1];
         uint8_t buf_len = 0;
 
-        if (!scan_request(uart_num, id, buf, &buf_len)) {
-            vTaskDelay(pdMS_TO_TICKS(SCAN_INTER_FRAME_MS));
-            continue;
+        bool got_response = scan_request(uart_num, id, buf, &buf_len);
+        
+        if (got_response) {
+            found++;
         }
 
-        found++;
-
-        bool is_multiframe = (buf_len == 8 && buf[0] >= 0x01 && buf[0] <= 0x0F);
+        bool is_multiframe = got_response && (buf_len == 8 && buf[0] >= 0x01 && buf[0] <= 0x0F);
 
         if (!is_multiframe) {
-            pos = snprintf(line, sizeof(line), "  0x%02X  ", id);
-            for (int i = 0; i < buf_len; i++)
-                pos += snprintf(line + pos, sizeof(line) - pos, "%02X ", buf[i]);
-            pos += snprintf(line + pos, sizeof(line) - pos, " [");
-            for (int i = 0; i < buf_len; i++)
-                pos += snprintf(line + pos, sizeof(line) - pos, "%c",
-                    (buf[i] >= 0x20 && buf[i] < 0x7F) ? buf[i] : '.');
-            pos += snprintf(line + pos, sizeof(line) - pos, "]\r\n");
-            CMD_SEND(sock, line, pos);
+            // Format frame according to current log_state.format and send directly
+            uint64_t ts = esp_timer_get_time();
+            pos = format_frame(line, sizeof(line), id, 
+                             got_response ? buf : NULL, 
+                             got_response ? buf_len : 0, 
+                             LIN_CHECKSUM_CLASSIC, ts, "SCAN");
+            // Use broadcast (ring buffer) instead of CMD_SEND to avoid WS buffer overflow
+            broadcast_to_clients(line, pos);
+            vTaskDelay(pdMS_TO_TICKS(10));  // Small delay for output to flush
         } else {
             uint8_t mf_data[SCAN_MAX_BLOCKS][LIN_MAX_DATA_LEN];
             uint8_t mf_len[SCAN_MAX_BLOCKS];
@@ -429,7 +444,7 @@ static void lin_scan_bus(uart_port_t uart_num, int sock)
     pos = snprintf(line, sizeof(line),
         "══════════════════════════════════════════\r\n"
         "Scan complete. %d frame ID(s) found.\r\n\r\n", found);
-    CMD_SEND(sock, line, pos);
+    broadcast_to_clients(line, pos);
     
     scan_active = false;  // Re-enable candump output
 }
@@ -784,7 +799,7 @@ void parse_command(char *cmd, int sock)
     // SCAN
     else if (strcmp(cmd, "SCAN") == 0) {
         snprintf(response, sizeof(response), "Scanning IDs 0x00-0x3F...\r\n");
-        CMD_SEND(sock, response, strlen(response));
+        broadcast_to_clients(response, strlen(response));
         lin_scan_bus(UART_NUM, sock);
     }
 
