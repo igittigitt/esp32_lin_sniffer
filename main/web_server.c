@@ -46,7 +46,7 @@ static struct {
 static SemaphoreHandle_t s_ws_mutex = NULL;
 
 // ── Antwort-Puffer für parse_command() via WebSocket ─────────────
-static char   s_ws_resp_buf[512];
+static char   s_ws_resp_buf[1024];
 static int    s_ws_resp_len = 0;
 static int    s_ws_resp_target_fd = -1;
 
@@ -98,8 +98,8 @@ static const char TERMINAL_HTML[] =
 "  <h1>LIN Sniffer <span style='color:#888;font-weight:400'>(v" LIN_SNIFFER_VERSION ")</span></h1>"
 "  <span id='ip' style='color:#888;font-size:11px'></span>"
 "  <div style='margin-left:auto;display:flex;gap:6px;align-items:center'>"
-"    <input id='otafile' type='file' accept='.bin' style='font-size:11px;color:#888' />"
-"    <button onclick='startOta()' style='background:#5a3e8a;padding:4px 10px;font-size:11px'>Flash</button>"
+"    <input id='otafile' type='file' accept='.bin' style='display:none' />"
+"    <button onclick='document.getElementById(\"otafile\").click()' style='background:#5a3e8a;padding:4px 10px;font-size:11px'>Flash</button>"
 "    <div id='otaprog' style='display:none;width:150px;height:6px;background:#333;border-radius:3px;overflow:hidden'>"
 "      <div id='otafill' style='height:100%;width:0%;background:#4caf50;transition:width .3s ease'></div>"
 "    </div>"
@@ -108,8 +108,8 @@ static const char TERMINAL_HTML[] =
 "</div>"
 "<div id='log'></div>"
 "<div id='inputbar'>"
-"  <input id='cmd' type='text' placeholder='Befehl (z.B. HEADER 0E, SCAN, HELP)' autocomplete='off' spellcheck='false' />"
-"  <button onclick='sendCmd()'>Senden</button>"
+"  <input id='cmd' type='text' placeholder='Command (e.g. HEADER 0E, SCAN, HELP)' autocomplete='off' spellcheck='false' />"
+"  <button onclick='sendCmd()'>Send</button>"
 "  <button onclick='clearLog()' style='background:#444'>Clear</button>"
 "  <button onclick='copyLog()' style='background:#444'>Copy</button>"
 "</div>"
@@ -142,14 +142,14 @@ static const char TERMINAL_HTML[] =
 "  ws.onopen=()=>{"
 "    status.className='ok';"
 "    document.getElementById('ip').textContent=location.host;"
-"    appendLine('# Verbunden','info');"
+"    appendLine('# Connected','info');"
 "  };"
 "  ws.onmessage=e=>{"
 "    e.data.split('\\n').forEach(l=>{if(l.trim())appendLine(l,classForLine(l));});"
 "  };"
 "  ws.onclose=()=>{"
 "    status.className='';"
-"    appendLine('# Verbindung getrennt — reconnect in 3s...','err');"
+"    appendLine('# Connection lost - reconnecting in 3s...','err');"
 "    setTimeout(connect,3000);"
 "  };"
 "  ws.onerror=()=>ws.close();"
@@ -198,9 +198,11 @@ static const char TERMINAL_HTML[] =
 "  autoScroll=log.scrollTop+log.clientHeight>=log.scrollHeight-20;"
 "});"
 ""
+"document.getElementById('otafile').addEventListener('change',startOta);"
+""
 "function startOta(){"
 "  const f=document.getElementById('otafile').files[0];"
-"  if(!f){alert('Bitte .bin-Datei wählen');return;}"
+"  if(!f){alert('Please select .bin file');return;}"
 "  const prog=document.getElementById('otaprog');"
 "  const fill=document.getElementById('otafill');"
 "  const st=document.getElementById('otastatus');"
@@ -223,26 +225,26 @@ static const char TERMINAL_HTML[] =
 "  xhr.upload.onload=function(){"
 "    fill.classList.add('indeterminate');"
 "    st.textContent='Flashing...';"
-"    appendLine('# OTA: Upload abgeschlossen, flashe...','info');"
+"    appendLine('# OTA: Upload complete, flashing...','info');"
 "  };"
 ""
 "  xhr.onload=function(){"
 "    fill.classList.remove('indeterminate');"
 "    fill.style.width='100%';"
 "    if(xhr.status===200){"
-"      st.textContent='OK — Neustart...';"
-"      appendLine('# OTA erfolgreich — warte auf Neustart...','info');"
+"      st.textContent='OK - Rebooting...';"
+"      appendLine('# OTA successful - waiting for reboot...','info');"
 "      waitForReboot();"
 "    }else{"
-"      st.textContent='Fehler: '+xhr.status;"
-"      appendLine('# OTA Fehler: '+xhr.status,'err');"
+"      st.textContent='Error: '+xhr.status;"
+"      appendLine('# OTA Error: '+xhr.status,'err');"
 "    }"
 "  };"
 ""
 "  xhr.onerror=function(){"
 "    fill.classList.remove('indeterminate');"
-"    st.textContent='Upload-Fehler';"
-"    appendLine('# OTA Upload-Fehler','err');"
+"    st.textContent='Upload failed';"
+"    appendLine('# OTA Upload failed','err');"
 "  };"
 ""
 "  xhr.open('POST','/ota');"
@@ -256,18 +258,18 @@ static const char TERMINAL_HTML[] =
 "  const max=30;"  /* max 30s warten */
 "  const timer=setInterval(async()=>{"
 "    attempts++;"
-"    st.textContent='Warte auf Neustart... ('+attempts+'s)';"
+"    st.textContent='Waiting for reboot... ('+attempts+'s)';"
 "    try{"
 "      const r=await fetch('/',{method:'HEAD',cache:'no-store'});"
 "      if(r.ok){"
 "        clearInterval(timer);"
-"        appendLine('# Gerät neu gestartet — lade Seite...','info');"
+"        appendLine('# Device rebooted - reloading page...','info');"
 "        setTimeout(()=>location.reload(),500);"
 "      }"
 "    }catch(e){ /* noch nicht erreichbar, weiter warten */ }"
 "    if(attempts>=max){"
 "      clearInterval(timer);"
-"      st.textContent='Timeout — bitte manuell neu laden';"
+"      st.textContent='Timeout - please reload manually';"
 "    }"
 "  },1000);"
 "}"
@@ -295,7 +297,7 @@ static esp_err_t handler_ota(httpd_req_t *req)
         esp_ota_get_next_update_partition(NULL);
 
     if (!update_part) {
-        ESP_LOGE(TAG, "Keine OTA-Partition gefunden!");
+        ESP_LOGE(TAG, "No OTA partition found!");
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                             "No OTA partition");
         return ESP_FAIL;
@@ -328,7 +330,7 @@ static esp_err_t handler_ota(httpd_req_t *req)
 
         if (received <= 0) {
             if (received == HTTPD_SOCK_ERR_TIMEOUT) continue;
-            ESP_LOGE(TAG, "Empfangsfehler: %d", received);
+            ESP_LOGE(TAG, "Receive error: %d", received);
             free(buf);
             esp_ota_abort(ota_handle);
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
@@ -369,7 +371,7 @@ static esp_err_t handler_ota(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "OTA erfolgreich (%d bytes) — Reboot...", total);
+    ESP_LOGI(TAG, "OTA successful (%d bytes) — Reboot...", total);
     httpd_resp_sendstr(req, "OK");
 
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -387,7 +389,7 @@ static void ws_client_add(int fd)
         if (s_ws_clients[i].fd == -1) {
             s_ws_clients[i].fd = fd;
             ringbuf_reader_init_from_history(&s_ws_clients[i].reader, 50);
-            ESP_LOGI(TAG, "WS Client %d verbunden (slot %d)", fd, i);
+            ESP_LOGI(TAG, "WS Client %d connected (slot %d)", fd, i);
             break;
         }
     }
@@ -400,7 +402,7 @@ static void ws_client_remove(int fd)
     for (int i = 0; i < WS_MAX_CLIENTS; i++) {
         if (s_ws_clients[i].fd == fd) {
             s_ws_clients[i].fd = -1;
-            ESP_LOGI(TAG, "WS Client %d getrennt (slot %d)", fd, i);
+            ESP_LOGI(TAG, "WS Client %d disconnected (slot %d)", fd, i);
             break;
         }
     }
@@ -412,7 +414,7 @@ static esp_err_t handler_ws(httpd_req_t *req)
     int fd = httpd_req_to_sockfd(req);
 
     if (req->method == HTTP_GET) {
-        ESP_LOGI(TAG, "WS: Client verbunden fd=%d", fd);
+        ESP_LOGI(TAG, "WS: Client connected fd=%d", fd);
         ws_client_add(fd);
 
         // Version beim WebSocket-Connect senden
@@ -496,7 +498,7 @@ static void ws_push_task(void *pvParameters)
                     s_server, s_ws_clients[i].fd, &pkt);
 
                 if (err != ESP_OK) {
-                    ESP_LOGW(TAG, "WS send fd=%d fehlgeschlagen, entferne Client",
+                    ESP_LOGW(TAG, "WS send fd=%d failed, removing client",
                              s_ws_clients[i].fd);
                     s_ws_clients[i].fd = -1;
                     break;
@@ -530,7 +532,7 @@ void web_server_start(void)
     cfg.send_wait_timeout  = 10;
 
     if (httpd_start(&s_server, &cfg) != ESP_OK) {
-        ESP_LOGE(TAG, "httpd_start fehlgeschlagen");
+        ESP_LOGE(TAG, "httpd_start failed");
         return;
     }
 
@@ -559,7 +561,7 @@ void web_server_start(void)
 
     xTaskCreate(ws_push_task, "ws_push", 4096, NULL, 4, NULL);
 
-    ESP_LOGI(TAG, "Webserver v" LIN_SNIFFER_VERSION " gestartet auf Port 80");
+    ESP_LOGI(TAG, "Webserver v" LIN_SNIFFER_VERSION " started on port 80");
 }
 
 void web_server_stop(void)

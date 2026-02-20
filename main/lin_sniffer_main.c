@@ -132,12 +132,26 @@ static struct {
     uint8_t       count;            // number of IDs in filter
 } filter_state = {0};
 
+// ── SCAN state ────────────────────────────────────────────────────
+static volatile bool scan_active = false;
+
+// ── LOG state ─────────────────────────────────────────────────────
+typedef enum {
+    LOG_FORMAT_CANDUMP,
+    LOG_FORMAT_HUMAN
+} log_format_t;
+
+static struct {
+    volatile bool active;
+    log_format_t  format;
+} log_state = {0};
+
 // ═══════════════════════════════════════════════════════════════════
 // Prototypes
 // ═══════════════════════════════════════════════════════════════════
 
 void    broadcast_to_clients(const char *message, int len);
-void    output_candump(uint8_t id, const uint8_t *data, uint8_t len,
+void    output_frame(uint8_t id, const uint8_t *data, uint8_t len,
                        lin_checksum_type_t checksum_type, uint64_t timestamp_us,
                        const char *label);
 void    lin_rx_callback(uint8_t id, const uint8_t *data, uint8_t len,
@@ -170,22 +184,60 @@ void broadcast_to_clients(const char *message, int len)
     ringbuf_push(message);
 }
 
-void output_candump(uint8_t id, const uint8_t *data, uint8_t len,
-                   lin_checksum_type_t checksum_type, uint64_t timestamp_us,
-                   const char *label)
+void output_frame(uint8_t id, const uint8_t *data, uint8_t len,
+                 lin_checksum_type_t checksum_type, uint64_t timestamp_us,
+                 const char *label)
 {
+    if (!log_state.active) return;  // Logging disabled
+    
     char buf[128];
     int pos = 0;
 
-    double timestamp_sec = (timestamp_us - boot_timestamp_us) / 1000000.0;
-    pos = snprintf(buf, sizeof(buf), "(%.6f) lin0 %03X#", timestamp_sec, id);
+    if (log_state.format == LOG_FORMAT_CANDUMP) {
+        // candump format: (timestamp) lin0 ID#DATA # label checksum
+        double timestamp_sec = (timestamp_us - boot_timestamp_us) / 1000000.0;
+        pos = snprintf(buf, sizeof(buf), "(%.6f) lin0 %03X#", timestamp_sec, id);
 
-    for (int i = 0; i < len; i++) {
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "%02X", data[i]);
+        if (data && len > 0) {
+            for (int i = 0; i < len; i++) {
+                pos += snprintf(buf + pos, sizeof(buf) - pos, "%02X", data[i]);
+            }
+            const char *chk_type = (checksum_type == LIN_CHECKSUM_CLASSIC) ? "Classic" : "Enhanced";
+            pos += snprintf(buf + pos, sizeof(buf) - pos, " # %s %s", label, chk_type);
+        } else {
+            pos += snprintf(buf + pos, sizeof(buf) - pos, " # UNANSWERED");
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "\r\n");
+        
+    } else {  // LOG_FORMAT_HUMAN
+        // Human format: ID | Data Bytes                      CRC | ASCII    |
+        char data_str[32] = "";
+        char crc_str[4] = "---";
+        char ascii_str[9] = "--------";
+        
+        if (data && len > 0) {
+            int dpos = 0;
+            for (int i = 0; i < len && i < 8; i++) {
+                dpos += snprintf(data_str + dpos, sizeof(data_str) - dpos, "%02X ", data[i]);
+            }
+            // Pad to 24 chars
+            while (dpos < 24) data_str[dpos++] = ' ';
+            data_str[24] = '\0';
+            
+            snprintf(crc_str, sizeof(crc_str), "%s", 
+                     (checksum_type == LIN_CHECKSUM_CLASSIC) ? "CLA" : "ENH");
+            
+            for (int i = 0; i < len && i < 8; i++) {
+                ascii_str[i] = (data[i] >= 0x20 && data[i] < 0x7F) ? data[i] : '.';
+            }
+            ascii_str[len < 8 ? len : 8] = '\0';
+        } else {
+            snprintf(data_str, sizeof(data_str), "%-24s", "UNANSWERED");
+        }
+        
+        pos = snprintf(buf, sizeof(buf), "%02X | %s %s | %-8s |\r\n",
+                      id, data_str, crc_str, ascii_str);
     }
-
-    const char *chk_type = (checksum_type == LIN_CHECKSUM_CLASSIC) ? "Classic" : "Enhanced";
-    pos += snprintf(buf + pos, sizeof(buf) - pos, " # %s %s\r\n", label, chk_type);
 
     broadcast_to_clients(buf, pos);
 }
@@ -198,6 +250,9 @@ void lin_rx_callback(uint8_t id, const uint8_t *data, uint8_t len,
                     lin_checksum_type_t checksum_type, uint64_t timestamp_us,
                     void *user_data)
 {
+    // Skip output during SCAN (SCAN reads directly from UART)
+    if (scan_active) return;
+    
     // Filter check: skip if not in allowed list
     if (!filter_check(id)) return;
 
@@ -210,7 +265,7 @@ void lin_rx_callback(uint8_t id, const uint8_t *data, uint8_t len,
         broadcast_to_clients(buf, pos);
     } else {
         led_indicator_send(LED_EVENT_LIN_RX);
-        output_candump(id, data, len, checksum_type, timestamp_us, "RX");
+        output_frame(id, data, len, checksum_type, timestamp_us, "RX");
         ESP_LOGD(TAG, "RX: ID 0x%02X, len %d", id, len);
     }
 }
@@ -282,6 +337,8 @@ static void lin_scan_bus(uart_port_t uart_num, int sock)
     char line[256];
     int  pos;
     int  found = 0;
+
+    scan_active = true;  // Disable candump output during scan
 
     pos = snprintf(line, sizeof(line), "\r\n+++ LIN Bus Scan  (0x00 - 0x3F) +++\r\n");
     CMD_SEND(sock, line, pos);
@@ -371,8 +428,10 @@ static void lin_scan_bus(uart_port_t uart_num, int sock)
 
     pos = snprintf(line, sizeof(line),
         "══════════════════════════════════════════\r\n"
-        "Scan abgeschlossen. %d Frame-ID(s) aktiv.\r\n\r\n", found);
+        "Scan complete. %d frame ID(s) found.\r\n\r\n", found);
     CMD_SEND(sock, line, pos);
+    
+    scan_active = false;  // Re-enable candump output
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -412,7 +471,7 @@ static void slave_sim_respond(uint8_t id)
     led_indicator_send(LED_EVENT_LIN_TX);
 
     // Log to candump (broadcast goes via ring buffer, non-blocking)
-    output_candump(id, slave_state.data, slave_state.data_len,
+    output_frame(id, slave_state.data, slave_state.data_len,
                    LIN_CHECKSUM_ENHANCED, esp_timer_get_time(), "SIM");
 }
 
@@ -523,7 +582,7 @@ void parse_command(char *cmd, int sock)
         }
         if (lin_send_frame(UART_NUM, &frame) == ESP_OK) {
             led_indicator_send(LED_EVENT_LIN_TX);
-            output_candump(frame.id, frame.data, frame.len,
+            output_frame(frame.id, frame.data, frame.len,
                           frame.checksum_type, esp_timer_get_time(), "TX");
             snprintf(response, sizeof(response), "OK\r\n");
         } else {
@@ -581,6 +640,7 @@ void parse_command(char *cmd, int sock)
         }
     }
 
+    // STOP
     // FILTER <ID> [<ID> ...]
     else if (strncmp(cmd, "FILTER ", 7) == 0) {
         char *token = strtok(cmd + 7, " ");
@@ -647,21 +707,23 @@ void parse_command(char *cmd, int sock)
         }
     }
 
-    // STOP
     else if (strcmp(cmd, "STOP") == 0) {
         bool stopped_poll   = poll_state.active;
         bool stopped_slave  = slave_state.active;
         bool stopped_filter = filter_state.active;
+        bool stopped_log    = log_state.active;
 
         if (stopped_poll)   poll_stop();
         if (stopped_slave)  slave_state.active = false;
         if (stopped_filter) filter_state.active = false;
+        if (stopped_log)    log_state.active = false;
 
         char msg[128] = "";
         int n = 0;
         if (stopped_poll)   n += snprintf(msg + n, sizeof(msg) - n, "POLL");
         if (stopped_slave)  n += snprintf(msg + n, sizeof(msg) - n, "%sSLAVE", n?" and ":"");
         if (stopped_filter) n += snprintf(msg + n, sizeof(msg) - n, "%sFILTER", n?" and ":"");
+        if (stopped_log)    n += snprintf(msg + n, sizeof(msg) - n, "%sLOG", n?" and ":"");
 
         if (n > 0)
             snprintf(response, sizeof(response), "%s stopped\r\n", msg);
@@ -689,6 +751,28 @@ void parse_command(char *cmd, int sock)
         CMD_SEND(sock, response, strlen(response));
     }
 
+    // LOG <format>
+    else if (strncmp(cmd, "LOG ", 4) == 0) {
+        char *format_str = cmd + 4;
+        // Convert format to uppercase for comparison
+        for (char *p = format_str; *p; p++) {
+            *p = (char)toupper((unsigned char)*p);
+        }
+        
+        if (strcmp(format_str, "CANDUMP") == 0) {
+            log_state.format = LOG_FORMAT_CANDUMP;
+            log_state.active = true;
+            snprintf(response, sizeof(response), "LOG started: CANDUMP format\r\n");
+        } else if (strcmp(format_str, "HUMAN") == 0) {
+            log_state.format = LOG_FORMAT_HUMAN;
+            log_state.active = true;
+            snprintf(response, sizeof(response), "LOG started: HUMAN format\r\n");
+        } else {
+            snprintf(response, sizeof(response), "ERROR: LOG CANDUMP | LOG HUMAN\r\n");
+        }
+        CMD_SEND(sock, response, strlen(response));
+    }
+
     // REBOOT
     else if (strcmp(cmd, "REBOOT") == 0) {
         snprintf(response, sizeof(response), "Rebooting...\r\n");
@@ -699,7 +783,7 @@ void parse_command(char *cmd, int sock)
 
     // SCAN
     else if (strcmp(cmd, "SCAN") == 0) {
-        snprintf(response, sizeof(response), "Scanning IDs 0x00-0x3F ...\r\n");
+        snprintf(response, sizeof(response), "Scanning IDs 0x00-0x3F...\r\n");
         CMD_SEND(sock, response, strlen(response));
         lin_scan_bus(UART_NUM, sock);
     }
@@ -713,7 +797,8 @@ void parse_command(char *cmd, int sock)
             "  POLL <ID> <ms> [<N>|<N>s]    - Poll ID every N ms (count or duration)\r\n"
             "  SLAVE <ID> <data>            - Simulate LIN slave response\r\n"
             "  FILTER <ID> [<ID>...]        - Show only specified IDs\r\n"
-            "  STOP                         - Stop POLL/SLAVE/FILTER\r\n"
+            "  LOG CANDUMP | LOG HUMAN      - Start logging in specified format\r\n"
+            "  STOP                         - Stop POLL/SLAVE/FILTER/LOG\r\n"
             "  SCAN                         - Scan all IDs 0x00-0x3F\r\n"
             "  WIFI <SSID> <PW>             - Set WiFi credentials and reboot\r\n"
             "  REBOOT                       - Restart device\r\n"
@@ -819,7 +904,7 @@ disconnect:
             break;
         }
     }
-    ESP_LOGI(TAG, "Telnet Client getrennt (sock=%d)", sock);
+    ESP_LOGI(TAG, "Telnet client disconnected (sock=%d)", sock);
     vTaskDelete(NULL);
 }
 
@@ -900,7 +985,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             vTaskDelay(pdMS_TO_TICKS(1000 * wifi_retry_count));
             esp_wifi_connect();
         } else {
-            ESP_LOGE(TAG, "WiFi fehlgeschlagen nach %d Versuchen — wechsle zu AP-Mode",
+            ESP_LOGE(TAG, "WiFi failed after %d attempts - switching to AP mode",
                      WIFI_MAX_RETRY);
             led_indicator_send(LED_EVENT_WIFI_ERROR);
             vTaskDelay(pdMS_TO_TICKS(2000));
