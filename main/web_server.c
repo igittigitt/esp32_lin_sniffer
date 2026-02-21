@@ -76,7 +76,7 @@ static const char TERMINAL_HTML[] =
 "#status{width:8px;height:8px;border-radius:50%;background:#f44}"
 "#status.ok{background:#4caf50}"
 "#version{margin-left:auto;color:#666;font-size:11px}"
-"#log{flex:1;overflow-y:auto;padding:8px 12px;font-size:12px}"
+"#log{flex:1;overflow-y:auto;padding:8px 12px;font-size:12px;white-space:pre}"
 ".rx{color:#9cdcfe}.tx{color:#dcdcaa}.err{color:#f44747}.info{color:#6a9955}.sys{color:#c586c0}"
 "#inputbar{display:flex;gap:6px;padding:8px;background:#252526;border-top:1px solid #333}"
 "#cmd{flex:1;background:#3c3c3c;border:1px solid #555;color:#d4d4d4;padding:6px 10px;font:inherit;border-radius:3px;outline:none}"
