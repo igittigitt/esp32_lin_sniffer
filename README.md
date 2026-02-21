@@ -80,6 +80,10 @@ Configurable options are:
 #define LIN_BAUDRATE    LIN_BAUDRATE_9600  // or LIN_BAUDRATE_19200
 ```
 
+# LINBUS Analyzer Tool
+
+In tools/ subdir you find a analyzing tool, written as pure Web-App so you can open it in any browser you like. It can read CANDUMP logfiles and offer several filter and statistic functions.
+
 # Commands
 
 Connect via Telnet on port 23 (default) using any terminal-program (e.g. PuTTY), or open any Web-Browser at http://<IP-OF-SNIFFER> and use the command-inputfield to issue one of the following commands.

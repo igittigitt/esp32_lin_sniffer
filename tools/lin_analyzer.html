@@ -1,0 +1,1144 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LIN Bus Analyzer</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Oxanium:wght@300;500;700&display=swap');
+
+  :root {
+    --bg: #0a0c0f;
+    --bg2: #0f1318;
+    --bg3: #141920;
+    --panel: #1a2030;
+    --border: #2a3545;
+    --accent: #00d4ff;
+    --accent2: #00ff9d;
+    --accent3: #ff6b35;
+    --accent4: #ffd700;
+    --text: #c8d8e8;
+    --text2: #7a9ab8;
+    --text3: #3a5a78;
+    --danger: #ff4466;
+    --mono: 'JetBrains Mono', monospace;
+    --display: 'Oxanium', sans-serif;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Grid background */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(0,212,255,0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,212,255,0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  #app { position: relative; z-index: 1; display: flex; flex-direction: column; min-height: 100vh; }
+
+  /* Header */
+  header {
+    background: linear-gradient(135deg, #0f1318 0%, #1a2030 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    backdrop-filter: blur(10px);
+  }
+
+  .logo {
+    font-family: var(--display);
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: 2px;
+    text-transform: uppercase;
+  }
+
+  .logo span { color: var(--accent2); }
+
+  .header-stats {
+    margin-left: auto;
+    display: flex;
+    gap: 20px;
+    font-size: 11px;
+    color: var(--text2);
+  }
+
+  .stat-pill {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    padding: 4px 12px;
+    border-radius: 20px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .stat-pill .val { color: var(--accent); font-weight: 700; }
+
+  /* Layout */
+  .main { display: flex; flex: 1; }
+
+  /* Sidebar */
+  .sidebar {
+    width: 320px;
+    min-width: 320px;
+    background: var(--bg2);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    overflow-y: auto;
+    max-height: calc(100vh - 60px);
+  }
+
+  .sidebar-section {
+    border-bottom: 1px solid var(--border);
+    padding: 16px;
+  }
+
+  .section-title {
+    font-family: var(--display);
+    font-size: 10px;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: var(--text3);
+    margin-bottom: 12px;
+  }
+
+  /* File drop zone */
+  .drop-zone {
+    border: 2px dashed var(--border);
+    border-radius: 8px;
+    padding: 24px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.2s;
+    color: var(--text2);
+  }
+
+  .drop-zone:hover, .drop-zone.drag-over {
+    border-color: var(--accent);
+    background: rgba(0,212,255,0.05);
+    color: var(--accent);
+  }
+
+  .drop-icon { font-size: 28px; margin-bottom: 8px; }
+  .drop-text { font-size: 12px; }
+
+  /* File list */
+  .file-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-bottom: 6px;
+    font-size: 11px;
+  }
+
+  .file-item .file-name { flex: 1; color: var(--accent2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-item .file-count { color: var(--text3); }
+  .file-remove { cursor: pointer; color: var(--danger); padding: 2px 6px; border-radius: 3px; background: rgba(255,68,102,0.1); border: none; color: var(--danger); font-size: 10px; cursor: pointer; transition: background 0.2s; }
+  .file-remove:hover { background: rgba(255,68,102,0.25); }
+
+  /* ID selector */
+  .id-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 4px;
+    max-height: 200px;
+    overflow-y: auto;
+  }
+
+  .id-chip {
+    padding: 5px 4px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    text-align: center;
+    cursor: pointer;
+    font-size: 11px;
+    background: var(--panel);
+    color: var(--text2);
+    transition: all 0.15s;
+    font-family: var(--mono);
+  }
+
+  .id-chip:hover { border-color: var(--accent); color: var(--accent); }
+  .id-chip.active { background: rgba(0,212,255,0.15); border-color: var(--accent); color: var(--accent); font-weight: 700; }
+
+  .id-chip .id-name { font-size: 8px; display: block; color: var(--accent3); }
+
+  /* Filter controls */
+  .filter-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
+  .filter-label { font-size: 11px; color: var(--text2); min-width: 70px; }
+
+  .toggle-group { display: flex; gap: 4px; flex-wrap: wrap; }
+
+  .toggle-btn {
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--panel);
+    color: var(--text2);
+    cursor: pointer;
+    font-family: var(--mono);
+    font-size: 11px;
+    transition: all 0.15s;
+  }
+
+  .toggle-btn:hover { border-color: var(--accent2); color: var(--accent2); }
+  .toggle-btn.active { background: rgba(0,255,157,0.15); border-color: var(--accent2); color: var(--accent2); }
+
+  /* Main content */
+  .content { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+  /* Tab bar */
+  .tab-bar {
+    display: flex;
+    gap: 0;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    padding: 0 24px;
+  }
+
+  .tab {
+    padding: 12px 20px;
+    cursor: pointer;
+    font-family: var(--display);
+    font-size: 11px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: var(--text3);
+    border-bottom: 2px solid transparent;
+    transition: all 0.15s;
+  }
+
+  .tab:hover { color: var(--text2); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  /* Table area */
+  .table-container {
+    flex: 1;
+    overflow: auto;
+    padding: 0;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+
+  thead {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: var(--bg3);
+  }
+
+  th {
+    padding: 10px 14px;
+    text-align: left;
+    font-family: var(--display);
+    font-size: 10px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--text3);
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    white-space: nowrap;
+    user-select: none;
+  }
+
+  th:hover { color: var(--accent); }
+  th.sorted { color: var(--accent); }
+
+  td {
+    padding: 7px 14px;
+    border-bottom: 1px solid rgba(42,53,69,0.5);
+    font-family: var(--mono);
+    vertical-align: middle;
+    white-space: nowrap;
+  }
+
+  tr:hover td { background: rgba(0,212,255,0.04); }
+
+  tr.changed-row td { background: rgba(0,255,157,0.04); }
+  tr.changed-row td:first-child { border-left: 2px solid var(--accent2); }
+
+  /* Cell types */
+  .cell-time { color: var(--text3); font-size: 11px; }
+  .cell-id { color: var(--accent4); font-weight: 700; font-size: 13px; }
+  .cell-id-known { color: var(--accent3); }
+  .cell-hex { color: var(--text); letter-spacing: 1px; }
+  .cell-binary { color: var(--text3); font-size: 10px; letter-spacing: 0.5px; }
+  .cell-status { font-size: 10px; }
+  .cell-source { color: var(--text3); font-size: 10px; max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
+  .cell-decoded { color: var(--accent2); font-size: 11px; }
+
+  .byte-block { display: inline-block; margin-right: 6px; }
+  .byte-changed { color: var(--accent2) !important; background: rgba(0,255,157,0.1); border-radius: 2px; padding: 0 2px; }
+
+  .status-ok { color: var(--accent2); }
+  .status-err { color: var(--danger); }
+  .status-unans { color: var(--accent4); }
+
+  /* Unique values view */
+  .unique-container { padding: 20px; }
+  .unique-id-section { margin-bottom: 24px; }
+  .unique-id-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .unique-id-title { font-family: var(--display); font-size: 14px; color: var(--accent4); }
+  .unique-id-name { color: var(--accent3); font-size: 12px; }
+  .unique-id-count { color: var(--text3); font-size: 11px; margin-left: auto; }
+
+  .value-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .value-chip {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 160px;
+  }
+  .vc-hex { color: var(--text); font-size: 13px; font-weight: 500; }
+  .vc-bin { color: var(--text3); font-size: 10px; letter-spacing: 0.5px; }
+  .vc-count { color: var(--accent2); font-size: 10px; }
+  .vc-decoded { color: var(--accent3); font-size: 10px; }
+
+  /* Delta view */
+  .delta-container { padding: 0; }
+
+  /* Stats view */
+  .stats-container { padding: 20px; display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
+  .stat-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .stat-card-title { font-family: var(--display); font-size: 11px; letter-spacing: 2px; text-transform: uppercase; color: var(--text3); margin-bottom: 12px; }
+  .stat-card-value { font-size: 28px; font-weight: 700; color: var(--accent); margin-bottom: 4px; }
+  .stat-card-sub { font-size: 11px; color: var(--text2); }
+
+  .id-bar-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; font-size: 12px; }
+  .id-bar-label { min-width: 45px; color: var(--accent4); }
+  .id-bar-name { min-width: 80px; color: var(--accent3); font-size: 10px; }
+  .id-bar-track { flex: 1; height: 14px; background: var(--bg3); border-radius: 3px; overflow: hidden; }
+  .id-bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2)); border-radius: 3px; transition: width 0.5s ease; }
+  .id-bar-count { min-width: 50px; text-align: right; color: var(--text2); font-size: 11px; }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg2); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--text3); }
+
+  /* Empty state */
+  .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 300px;
+    color: var(--text3);
+    gap: 12px;
+  }
+  .empty-state .icon { font-size: 48px; }
+  .empty-state .msg { font-family: var(--display); font-size: 14px; letter-spacing: 2px; }
+
+  /* Toolbar */
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 16px;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+
+  .toolbar input[type=text] {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 6px 12px;
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-size: 12px;
+    width: 160px;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  .toolbar input:focus { border-color: var(--accent); }
+
+  .toolbar-label { font-size: 11px; color: var(--text3); }
+
+  .row-count { margin-left: auto; font-size: 11px; color: var(--text3); }
+
+  .btn {
+    padding: 6px 14px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--panel);
+    color: var(--text2);
+    cursor: pointer;
+    font-family: var(--mono);
+    font-size: 11px;
+    transition: all 0.15s;
+  }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn.primary { border-color: var(--accent); color: var(--accent); background: rgba(0,212,255,0.08); }
+
+  input[type=file] { display: none; }
+
+  .pulse {
+    display: inline-block;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--accent2);
+    box-shadow: 0 0 6px var(--accent2);
+    animation: pulse 2s infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+
+  .highlight-changed .byte-block:not(.byte-changed) { opacity: 0.4; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="logo">LIN<span>BUS</span> ANALYZER</div>
+    <div style="font-size:11px; color:var(--text3); letter-spacing:1px;">FORD LIN DIAGNOSTIC TOOL</div>
+    <div class="header-stats" id="header-stats">
+      <div class="stat-pill"><span>FRAMES</span><span class="val" id="stat-total">0</span></div>
+      <div class="stat-pill"><span>IDs</span><span class="val" id="stat-ids">0</span></div>
+      <div class="stat-pill"><span>FILES</span><span class="val" id="stat-files">0</span></div>
+    </div>
+  </header>
+
+  <div class="main">
+    <!-- Sidebar -->
+    <div class="sidebar">
+      <!-- File loading -->
+      <div class="sidebar-section">
+        <div class="section-title">Log Files</div>
+        <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
+          <div class="drop-icon">📂</div>
+          <div class="drop-text">Drop .log files or click to browse</div>
+        </div>
+        <input type="file" id="file-input" multiple accept=".log,.txt">
+        <div id="file-list" style="margin-top:10px;"></div>
+      </div>
+
+      <!-- ID Filter -->
+      <div class="sidebar-section">
+        <div class="section-title">Frame ID Filter</div>
+        <div style="display:flex;gap:6px;margin-bottom:10px;">
+          <button class="btn primary" onclick="selectAllIds()">ALL</button>
+          <button class="btn" onclick="clearAllIds()">NONE</button>
+        </div>
+        <div class="id-grid" id="id-grid"></div>
+      </div>
+
+      <!-- Display Options -->
+      <div class="sidebar-section">
+        <div class="section-title">Display Options</div>
+
+        <div class="filter-row">
+          <span class="filter-label">Format:</span>
+          <div class="toggle-group">
+            <button class="toggle-btn active" id="opt-hex" onclick="toggleOpt('hex')">HEX</button>
+            <button class="toggle-btn active" id="opt-bin" onclick="toggleOpt('bin')">BIN</button>
+            <button class="toggle-btn active" id="opt-dec" onclick="toggleOpt('dec')">DEC</button>
+          </div>
+        </div>
+
+        <div class="filter-row">
+          <span class="filter-label">Changes:</span>
+          <div class="toggle-group">
+            <button class="toggle-btn" id="opt-onlychanged" onclick="toggleOpt('onlychanged')">ONLY ΔCHANGED</button>
+            <button class="toggle-btn active" id="opt-markchanged" onclick="toggleOpt('markchanged')">MARK Δ</button>
+          </div>
+        </div>
+
+        <div class="filter-row">
+          <span class="filter-label">Decode:</span>
+          <div class="toggle-group">
+            <button class="toggle-btn active" id="opt-decoded" onclick="toggleOpt('decoded')">SHOW DECODED</button>
+          </div>
+        </div>
+
+        <div class="filter-row">
+          <span class="filter-label">Source:</span>
+          <div class="toggle-group">
+            <button class="toggle-btn active" id="opt-source" onclick="toggleOpt('source')">SHOW FILE</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Status filter -->
+      <div class="sidebar-section">
+        <div class="section-title">Status Filter</div>
+        <div class="toggle-group">
+          <button class="toggle-btn active" id="filt-ok" onclick="toggleFilter('ok')">✓ OK</button>
+          <button class="toggle-btn active" id="filt-unans" onclick="toggleFilter('unans')">⚠ UNANS</button>
+          <button class="toggle-btn active" id="filt-err" onclick="toggleFilter('err')">✗ ERROR</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Content -->
+    <div class="content">
+      <div class="tab-bar">
+        <div class="tab active" onclick="switchTab('frames', this)">FRAMES</div>
+        <div class="tab" onclick="switchTab('unique', this)">UNIQUE VALUES</div>
+        <div class="tab" onclick="switchTab('delta', this)">DELTA VIEW</div>
+        <div class="tab" onclick="switchTab('stats', this)">STATISTICS</div>
+      </div>
+
+      <div class="toolbar">
+        <span class="toolbar-label">SEARCH:</span>
+        <input type="text" id="search-input" placeholder="hex data, timestamp..." oninput="applyFilters()">
+        <span class="toolbar-label">TIME FROM:</span>
+        <input type="text" id="time-from" placeholder="0.0" style="width:80px;" oninput="applyFilters()">
+        <span class="toolbar-label">TO:</span>
+        <input type="text" id="time-to" placeholder="∞" style="width:80px;" oninput="applyFilters()">
+        <button class="btn" onclick="clearFilters()">CLEAR</button>
+        <span class="row-count" id="row-count">0 rows</span>
+      </div>
+
+      <div class="table-container" id="content-area">
+        <div class="empty-state">
+          <div class="icon">📡</div>
+          <div class="msg">LOAD LOG FILES TO BEGIN</div>
+          <div style="font-size:11px;color:var(--text3);">Drop .log files into the sidebar</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ─────────────────────────────────────────────────────────────
+// KNOWN IDs with decode info
+// ─────────────────────────────────────────────────────────────
+const KNOWN_IDS = {
+  '005': { name: 'WIPER STATUS', color: '#ff6b35', decode: decodeWiper },
+  '006': { name: 'RAIN SENSOR', color: '#00d4ff', decode: decodeRain },
+  '008': { name: 'UNKNOWN 0x08', color: '#7a9ab8' },
+  '00D': { name: 'BAT SENSOR', color: '#ffd700', decode: decodeBattery },
+  '00E': { name: 'BAT EXT1', color: '#ffd700', decode: decodeBatExt },
+  '00F': { name: 'BAT EXT2', color: '#ffd700' },
+  '010': { name: 'BCM MISC', color: '#c8a0ff' },
+  '017': { name: 'BAT 0x17', color: '#ffd700' },
+  '020': { name: 'BCM WIPER CTL', color: '#00ff9d', decode: decodeBCMWiper },
+  '022': { name: 'BAT 0x22', color: '#ffd700' },
+  '026': { name: 'BAT 0x26', color: '#ffd700' },
+  '027': { name: 'BAT 0x27', color: '#ffd700' },
+  '02A': { name: 'BAT 0x2A', color: '#ffd700' },
+  '02B': { name: 'IMS DATA', color: '#ff9fff', decode: decodeIMS },
+  '03C': { name: 'SLEEP CMD', color: '#ff4466' },
+};
+
+// ─────────────────────────────────────────────────────────────
+// DECODE FUNCTIONS
+// ─────────────────────────────────────────────────────────────
+function hexToBytes(hex) {
+  if (!hex || hex === '') return [];
+  const bytes = [];
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes.push(parseInt(hex.substr(i, 2), 16));
+  }
+  return bytes;
+}
+
+function decodeBattery(hex) {
+  const b = hexToBytes(hex);
+  if (b.length < 3) return null;
+  const raw = (b[1] << 8) | b[0];
+  const I = ((raw - 0x2000) * 10).toFixed(0);
+  const V = (b[2] / 16.0).toFixed(2);
+  return `I=${I}mA  V=${V}V`;
+}
+
+function decodeBatExt(hex) {
+  const b = hexToBytes(hex);
+  if (b.length < 2) return null;
+  return `raw: b0=${b[0]} b1=${b[1]}`;
+}
+
+function decodeWiper(hex) {
+  const b = hexToBytes(hex);
+  if (b.length < 1) return null;
+  const v = b[0];
+  if (v === 0x40) return '⟳ REST POSITION';
+  if (v === 0x01) return '✓ AUTO READY';
+  if (v === 0x00) return '▶ ACTIVE';
+  if (v === 0x41) return '◉ REST+PENDING';
+  return `state=0x${v.toString(16).toUpperCase()}`;
+}
+
+function decodeRain(hex) {
+  const b = hexToBytes(hex);
+  if (b.length < 2) return null;
+  const intensity = b[0];
+  if (intensity === 0) return '☀ NO RAIN';
+  return `🌧 INTENSITY: ${intensity}`;
+}
+
+function decodeBCMWiper(hex) {
+  const b = hexToBytes(hex);
+  if (b.length < 2) return null;
+  const sens = b[1] & 0x0F;
+  const sensLabel = sens > 0 ? `SENS=${sens}(lvl${sens+1})` : '';
+  const byte0 = b[0];
+  let mode = '';
+  if ((byte0 & 0x10) === 0x10) mode += 'AUTO ';
+  if (byte0 === 0x84) mode += 'IDLE';
+  if (byte0 === 0x85) mode += 'ACTIVE';
+  if (byte0 === 0x94) mode += 'RUNNING';
+  return `${mode} ${sensLabel}`.trim() || null;
+}
+
+function decodeIMS(hex) {
+  const b = hexToBytes(hex);
+  if (b.length < 2) return null;
+  // Try to extract ASCII from bytes 2-8
+  let ascii = '';
+  for (let i = 2; i < b.length; i++) {
+    if (b[i] >= 0x20 && b[i] < 0x7f) ascii += String.fromCharCode(b[i]);
+    else if (b[i] !== 0) ascii += '.';
+  }
+  return ascii ? `"${ascii}"` : null;
+}
+
+// ─────────────────────────────────────────────────────────────
+// STATE
+// ─────────────────────────────────────────────────────────────
+let allFrames = [];
+let files = [];
+let selectedIds = new Set();
+let activeTab = 'frames';
+let opts = { hex: true, bin: true, dec: true, onlychanged: false, markchanged: true, decoded: true, source: true };
+let statusFilter = { ok: true, unans: true, err: true };
+let filteredFrames = [];
+
+// ─────────────────────────────────────────────────────────────
+// PARSE
+// ─────────────────────────────────────────────────────────────
+function parseLog(text, filename) {
+  const frames = [];
+  const lines = text.split('\n');
+  for (const line of lines) {
+    const m = line.match(/^\((\d+\.\d+)\)\s+\w+\s+([0-9A-Fa-f]+)#([0-9A-Fa-f]*)\s*(?:#\s*(.+))?/);
+    if (!m) continue;
+    const ts = parseFloat(m[1]);
+    const id = m[2].toUpperCase().padStart(3, '0');
+    const data = m[3].toUpperCase();
+    const comment = (m[4] || '').trim();
+    let status = 'ok';
+    if (comment.includes('UNANSWERED')) status = 'unans';
+    else if (comment.includes('ERROR')) status = 'err';
+    frames.push({ ts, id, data, comment, status, source: filename });
+  }
+  return frames;
+}
+
+// ─────────────────────────────────────────────────────────────
+// FILE LOADING
+// ─────────────────────────────────────────────────────────────
+function loadFiles(fileList) {
+  for (const f of fileList) {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const frames = parseLog(e.target.result, f.name);
+      files.push({ name: f.name, count: frames.length });
+      allFrames.push(...frames);
+      // Sort by timestamp
+      allFrames.sort((a, b) => a.ts - b.ts);
+      rebuildIdList();
+      applyFilters();
+      renderFileList();
+      updateStats();
+    };
+    reader.readAsText(f);
+  }
+}
+
+function rebuildIdList() {
+  const ids = [...new Set(allFrames.map(f => f.id))].sort();
+  selectedIds = new Set(ids);
+  const grid = document.getElementById('id-grid');
+  grid.innerHTML = '';
+  for (const id of ids) {
+    const info = KNOWN_IDS[id];
+    const chip = document.createElement('div');
+    chip.className = 'id-chip active';
+    chip.dataset.id = id;
+    chip.innerHTML = `0x${id}${info ? `<span class="id-name">${info.name.split(' ').slice(0,2).join(' ')}</span>` : ''}`;
+    if (info) chip.style.borderColor = info.color + '66';
+    chip.onclick = () => toggleId(id, chip);
+    grid.appendChild(chip);
+  }
+}
+
+function toggleId(id, chip) {
+  if (selectedIds.has(id)) { selectedIds.delete(id); chip.classList.remove('active'); }
+  else { selectedIds.add(id); chip.classList.add('active'); }
+  applyFilters();
+}
+
+function selectAllIds() {
+  document.querySelectorAll('.id-chip').forEach(c => { c.classList.add('active'); selectedIds.add(c.dataset.id); });
+  applyFilters();
+}
+
+function clearAllIds() {
+  document.querySelectorAll('.id-chip').forEach(c => { c.classList.remove('active'); });
+  selectedIds.clear();
+  applyFilters();
+}
+
+// ─────────────────────────────────────────────────────────────
+// FILTERS
+// ─────────────────────────────────────────────────────────────
+function applyFilters() {
+  const search = document.getElementById('search-input').value.toLowerCase();
+  const timeFrom = parseFloat(document.getElementById('time-from').value) || 0;
+  const timeTo = parseFloat(document.getElementById('time-to').value) || Infinity;
+
+  filteredFrames = allFrames.filter(f => {
+    if (!selectedIds.has(f.id)) return false;
+    if (!statusFilter[f.status]) return false;
+    if (f.ts < timeFrom || f.ts > timeTo) return false;
+    if (search && !f.id.toLowerCase().includes(search) && !f.data.toLowerCase().includes(search) && !f.ts.toString().includes(search)) return false;
+    return true;
+  });
+
+  document.getElementById('row-count').textContent = `${filteredFrames.length.toLocaleString()} rows`;
+  renderCurrentTab();
+}
+
+function clearFilters() {
+  document.getElementById('search-input').value = '';
+  document.getElementById('time-from').value = '';
+  document.getElementById('time-to').value = '';
+  applyFilters();
+}
+
+// ─────────────────────────────────────────────────────────────
+// OPTION TOGGLES
+// ─────────────────────────────────────────────────────────────
+function toggleOpt(key) {
+  opts[key] = !opts[key];
+  const btn = document.getElementById('opt-' + key);
+  btn.classList.toggle('active', opts[key]);
+  renderCurrentTab();
+}
+
+function toggleFilter(key) {
+  statusFilter[key] = !statusFilter[key];
+  const btn = document.getElementById('filt-' + key);
+  btn.classList.toggle('active', statusFilter[key]);
+  applyFilters();
+}
+
+// ─────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────
+function hexToBin(hex) {
+  if (!hex) return '';
+  let bin = '';
+  for (let i = 0; i < hex.length; i += 2) {
+    const byte = parseInt(hex.substr(i, 2), 16);
+    bin += byte.toString(2).padStart(8, '0') + ' ';
+  }
+  return bin.trim();
+}
+
+function hexToDec(hex) {
+  if (!hex) return '';
+  const parts = [];
+  for (let i = 0; i < hex.length; i += 2) {
+    parts.push(parseInt(hex.substr(i, 2), 16));
+  }
+  return parts.join(' ');
+}
+
+function formatBytes(hex, prevHex) {
+  if (!hex || hex === '') return '<span style="color:var(--text3)">—</span>';
+  let html = '';
+  for (let i = 0; i < hex.length; i += 2) {
+    const byteHex = hex.substr(i, 2);
+    const prevByteHex = prevHex ? prevHex.substr(i, 2) : null;
+    const changed = prevByteHex !== null && byteHex !== prevByteHex;
+    const cls = changed && opts.markchanged ? 'byte-block byte-changed' : 'byte-block';
+    let content = '';
+    if (opts.hex) content += `<span>${byteHex}</span>`;
+    if (opts.bin) content += `<span style="font-size:9px;color:${changed && opts.markchanged ? 'var(--accent2)' : 'var(--text3)'};">${parseInt(byteHex,16).toString(2).padStart(8,'0')}</span>`;
+    if (opts.dec) content += `<span style="font-size:9px;color:var(--text3);">${parseInt(byteHex,16)}</span>`;
+    html += `<span class="${cls}" style="display:inline-flex;flex-direction:column;gap:1px;margin-right:8px;">${content}</span>`;
+  }
+  return html;
+}
+
+function getDecoded(id, hex) {
+  const info = KNOWN_IDS[id];
+  if (!info || !info.decode || !hex) return '';
+  try { return info.decode(hex) || ''; } catch { return ''; }
+}
+
+// ─────────────────────────────────────────────────────────────
+// TABS
+// ─────────────────────────────────────────────────────────────
+function switchTab(tab, el) {
+  activeTab = tab;
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  el.classList.add('active');
+  renderCurrentTab();
+}
+
+function renderCurrentTab() {
+  if (activeTab === 'frames') renderFrames();
+  else if (activeTab === 'unique') renderUnique();
+  else if (activeTab === 'delta') renderDelta();
+  else if (activeTab === 'stats') renderStats();
+}
+
+// ─────────────────────────────────────────────────────────────
+// FRAMES VIEW
+// ─────────────────────────────────────────────────────────────
+function renderFrames() {
+  const area = document.getElementById('content-area');
+  if (filteredFrames.length === 0) {
+    area.innerHTML = '<div class="empty-state"><div class="icon">📡</div><div class="msg">NO DATA</div></div>';
+    return;
+  }
+
+  // Track previous data per ID for change detection
+  const prevData = {};
+  const MAX_ROWS = 5000;
+  const rows = [];
+
+  let displayFrames = filteredFrames;
+  if (opts.onlychanged) {
+    // only show frames where data differs from last seen
+    const lastSeen = {};
+    displayFrames = filteredFrames.filter(f => {
+      if (lastSeen[f.id] !== f.data) { lastSeen[f.id] = f.data; return true; }
+      return false;
+    });
+  }
+
+  const shown = displayFrames.slice(0, MAX_ROWS);
+
+  let html = `<table><thead><tr>
+    <th>TIMESTAMP</th>
+    <th>ID</th>
+    <th>DATA BYTES</th>
+    ${opts.decoded ? '<th>DECODED</th>' : ''}
+    <th>STATUS</th>
+    ${opts.source ? '<th>SOURCE</th>' : ''}
+  </tr></thead><tbody>`;
+
+  for (const f of shown) {
+    const info = KNOWN_IDS[f.id];
+    const prev = prevData[f.id];
+    const changed = prev !== undefined && prev !== f.data;
+    if (opts.onlychanged && !changed && prev !== undefined) { prevData[f.id] = f.data; continue; }
+    prevData[f.id] = f.data;
+
+    const idColor = info ? info.color : 'var(--text2)';
+    const rowCls = changed ? 'changed-row' : '';
+    const decoded = getDecoded(f.id, f.data);
+    const statusCls = f.status === 'ok' ? 'status-ok' : f.status === 'unans' ? 'status-unans' : 'status-err';
+    const statusTxt = f.status === 'ok' ? '✓' : f.status === 'unans' ? '⚡' : '✗';
+
+    html += `<tr class="${rowCls}">
+      <td class="cell-time">${f.ts.toFixed(6)}</td>
+      <td><span style="color:${idColor};font-weight:700;">0x${f.id}</span>${info ? `<br><span style="font-size:9px;color:${idColor}88;">${info.name}</span>` : ''}</td>
+      <td>${formatBytes(f.data, prev)}</td>
+      ${opts.decoded ? `<td class="cell-decoded">${decoded}</td>` : ''}
+      <td class="cell-status ${statusCls}">${statusTxt}</td>
+      ${opts.source ? `<td class="cell-source" title="${f.source}">${f.source}</td>` : ''}
+    </tr>`;
+  }
+
+  if (displayFrames.length > MAX_ROWS) {
+    html += `<tr><td colspan="10" style="text-align:center;padding:12px;color:var(--text3);">
+      … showing first ${MAX_ROWS.toLocaleString()} of ${displayFrames.length.toLocaleString()} rows
+    </td></tr>`;
+  }
+
+  html += '</tbody></table>';
+  area.innerHTML = html;
+}
+
+// ─────────────────────────────────────────────────────────────
+// UNIQUE VALUES VIEW
+// ─────────────────────────────────────────────────────────────
+function renderUnique() {
+  const area = document.getElementById('content-area');
+  if (filteredFrames.length === 0) {
+    area.innerHTML = '<div class="empty-state"><div class="icon">📊</div><div class="msg">NO DATA</div></div>';
+    return;
+  }
+
+  // Group by ID
+  const byId = {};
+  for (const f of filteredFrames) {
+    if (!byId[f.id]) byId[f.id] = {};
+    byId[f.id][f.data] = (byId[f.id][f.data] || 0) + 1;
+  }
+
+  let html = '<div class="unique-container">';
+
+  for (const id of Object.keys(byId).sort()) {
+    const info = KNOWN_IDS[id];
+    const color = info ? info.color : 'var(--text2)';
+    const values = byId[id];
+    const totalCount = Object.values(values).reduce((a, b) => a + b, 0);
+    const uniqueCount = Object.keys(values).length;
+
+    html += `<div class="unique-id-section">
+      <div class="unique-id-header">
+        <span class="unique-id-title" style="color:${color}">0x${id}</span>
+        ${info ? `<span class="unique-id-name">${info.name}</span>` : ''}
+        <span class="unique-id-count">${uniqueCount} unique / ${totalCount} total</span>
+      </div>
+      <div class="value-chips">`;
+
+    // Sort by count desc
+    const sorted = Object.entries(values).sort((a, b) => b[1] - a[1]);
+    for (const [data, count] of sorted) {
+      const decoded = getDecoded(id, data);
+      const pct = ((count / totalCount) * 100).toFixed(1);
+      html += `<div class="value-chip">
+        <div class="vc-hex">${data || '(empty)'}</div>
+        <div class="vc-bin">${hexToBin(data)}</div>
+        ${opts.dec ? `<div class="vc-bin" style="color:var(--text2);">[${hexToDec(data)}]</div>` : ''}
+        ${decoded && opts.decoded ? `<div class="vc-decoded">${decoded}</div>` : ''}
+        <div class="vc-count">${count}× (${pct}%)</div>
+      </div>`;
+    }
+
+    html += '</div></div>';
+  }
+
+  html += '</div>';
+  area.innerHTML = html;
+}
+
+// ─────────────────────────────────────────────────────────────
+// DELTA VIEW — only changed rows per ID
+// ─────────────────────────────────────────────────────────────
+function renderDelta() {
+  const area = document.getElementById('content-area');
+  if (filteredFrames.length === 0) {
+    area.innerHTML = '<div class="empty-state"><div class="icon">△</div><div class="msg">NO DATA</div></div>';
+    return;
+  }
+
+  const lastSeen = {};
+  const changes = [];
+  for (const f of filteredFrames) {
+    if (lastSeen[f.id] !== f.data) {
+      changes.push({ ...f, prevData: lastSeen[f.id] });
+      lastSeen[f.id] = f.data;
+    }
+  }
+
+  if (changes.length === 0) {
+    area.innerHTML = '<div class="empty-state"><div class="icon">△</div><div class="msg">NO CHANGES DETECTED</div></div>';
+    return;
+  }
+
+  let html = `<table><thead><tr>
+    <th>TIMESTAMP</th>
+    <th>ID</th>
+    <th>PREV</th>
+    <th>NEW (Δ HIGHLIGHTED)</th>
+    ${opts.decoded ? '<th>DECODED</th>' : ''}
+    ${opts.source ? '<th>SOURCE</th>' : ''}
+  </tr></thead><tbody>`;
+
+  const MAX = 3000;
+  for (const f of changes.slice(0, MAX)) {
+    const info = KNOWN_IDS[f.id];
+    const color = info ? info.color : 'var(--text2)';
+    const decoded = getDecoded(f.id, f.data);
+
+    html += `<tr class="changed-row">
+      <td class="cell-time">${f.ts.toFixed(6)}</td>
+      <td><span style="color:${color};font-weight:700;">0x${f.id}</span>${info ? `<br><span style="font-size:9px;color:${color}88;">${info.name}</span>` : ''}</td>
+      <td style="opacity:0.5;">${f.prevData !== undefined ? formatBytesSimple(f.prevData) : '<span style="color:var(--text3)">—</span>'}</td>
+      <td>${formatBytes(f.data, f.prevData)}</td>
+      ${opts.decoded ? `<td class="cell-decoded">${decoded}</td>` : ''}
+      ${opts.source ? `<td class="cell-source">${f.source}</td>` : ''}
+    </tr>`;
+  }
+  if (changes.length > MAX) {
+    html += `<tr><td colspan="8" style="text-align:center;padding:12px;color:var(--text3);">… ${changes.length.toLocaleString()} total changes</td></tr>`;
+  }
+
+  html += '</tbody></table>';
+  area.innerHTML = html;
+}
+
+function formatBytesSimple(hex) {
+  if (!hex) return '<span style="color:var(--text3)">—</span>';
+  let html = '';
+  for (let i = 0; i < hex.length; i += 2) {
+    html += `<span class="byte-block" style="display:inline-block;margin-right:6px;">${hex.substr(i,2)}</span>`;
+  }
+  return html;
+}
+
+// ─────────────────────────────────────────────────────────────
+// STATS VIEW
+// ─────────────────────────────────────────────────────────────
+function renderStats() {
+  const area = document.getElementById('content-area');
+  if (filteredFrames.length === 0) {
+    area.innerHTML = '<div class="empty-state"><div class="icon">📊</div><div class="msg">NO DATA</div></div>';
+    return;
+  }
+
+  const byCounts = {};
+  for (const f of filteredFrames) byCounts[f.id] = (byCounts[f.id] || 0) + 1;
+  const maxCount = Math.max(...Object.values(byCounts));
+  const ids = Object.keys(byCounts).sort((a, b) => byCounts[b] - byCounts[a]);
+
+  const statusCounts = { ok: 0, unans: 0, err: 0 };
+  for (const f of filteredFrames) statusCounts[f.status]++;
+
+  let html = '<div class="stats-container">';
+
+  // Total frames
+  html += `<div class="stat-card">
+    <div class="stat-card-title">Total Frames</div>
+    <div class="stat-card-value">${filteredFrames.length.toLocaleString()}</div>
+    <div class="stat-card-sub">✓ OK: ${statusCounts.ok} | ⚡ UNANS: ${statusCounts.unans} | ✗ ERR: ${statusCounts.err}</div>
+  </div>`;
+
+  // Time span
+  if (filteredFrames.length > 1) {
+    const tspan = filteredFrames[filteredFrames.length-1].ts - filteredFrames[0].ts;
+    const fps = (filteredFrames.length / tspan).toFixed(1);
+    html += `<div class="stat-card">
+      <div class="stat-card-title">Time Span</div>
+      <div class="stat-card-value">${tspan.toFixed(1)}s</div>
+      <div class="stat-card-sub">${fps} frames/sec avg</div>
+    </div>`;
+  }
+
+  // Unique IDs
+  html += `<div class="stat-card">
+    <div class="stat-card-title">Unique IDs</div>
+    <div class="stat-card-value">${ids.length}</div>
+    <div class="stat-card-sub">across ${files.length} file(s)</div>
+  </div>`;
+
+  // Frame frequency bar chart
+  html += `<div class="stat-card" style="grid-column:span 2">
+    <div class="stat-card-title">Frames per ID</div>`;
+  for (const id of ids) {
+    const info = KNOWN_IDS[id];
+    const pct = (byCounts[id] / maxCount * 100).toFixed(1);
+    const color = info ? info.color : 'var(--accent)';
+    html += `<div class="id-bar-row">
+      <div class="id-bar-label" style="color:${color}">0x${id}</div>
+      <div class="id-bar-name">${info ? info.name : ''}</div>
+      <div class="id-bar-track"><div class="id-bar-fill" style="width:${pct}%;background:linear-gradient(90deg,${color},${color}88);"></div></div>
+      <div class="id-bar-count">${byCounts[id].toLocaleString()}</div>
+    </div>`;
+  }
+  html += '</div>';
+
+  html += '</div>';
+  area.innerHTML = html;
+}
+
+// ─────────────────────────────────────────────────────────────
+// UI HELPERS
+// ─────────────────────────────────────────────────────────────
+function renderFileList() {
+  const list = document.getElementById('file-list');
+  list.innerHTML = '';
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    const item = document.createElement('div');
+    item.className = 'file-item';
+    item.innerHTML = `<span class="file-name" title="${f.name}">${f.name}</span><span class="file-count">${f.count}</span><button class="file-remove" onclick="removeFile(${i})">✕</button>`;
+    list.appendChild(item);
+  }
+}
+
+function removeFile(idx) {
+  const name = files[idx].name;
+  files.splice(idx, 1);
+  allFrames = allFrames.filter(f => f.source !== name);
+  rebuildIdList();
+  applyFilters();
+  renderFileList();
+  updateStats();
+}
+
+function updateStats() {
+  document.getElementById('stat-total').textContent = allFrames.length.toLocaleString();
+  document.getElementById('stat-ids').textContent = new Set(allFrames.map(f => f.id)).size;
+  document.getElementById('stat-files').textContent = files.length;
+}
+
+// ─────────────────────────────────────────────────────────────
+// FILE INPUT & DROP
+// ─────────────────────────────────────────────────────────────
+document.getElementById('file-input').addEventListener('change', e => loadFiles(e.target.files));
+
+const dz = document.getElementById('drop-zone');
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag-over'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
+dz.addEventListener('drop', e => {
+  e.preventDefault();
+  dz.classList.remove('drag-over');
+  loadFiles(e.dataTransfer.files);
+});
+</script>
+</body>
+</html>
