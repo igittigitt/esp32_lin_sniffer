@@ -184,17 +184,17 @@ Use `STOP` to stop logging.
 ---
 
 ### `STOP`
-Stops a running `POLL`, `SLAVE` simulation, `FILTER`, or `LOG` (or any combination if multiple are active).
+Stops a running `POLL`, `SLAVE` simulation, or `FILTER` (or any combination if multiple are active).
 
 ```
 STOP
-→ LOG stopped
+→ POLL stopped
 
 STOP
-→ POLL and LOG stopped
+→ SLAVE stopped
 
 STOP
-→ POLL and SLAVE and FILTER and LOG stopped
+→ POLL and SLAVE and FILTER stopped
 
 STOP
 → Nothing running
@@ -314,17 +314,17 @@ Use `STOP` to stop logging.
 ---
 
 ### `STOP`
-Stops a running `POLL`, `SLAVE` simulation, `FILTER`, or `LOG` (or any combination if multiple are active).
+Stops a running `POLL`, `SLAVE` simulation, or `FILTER` (or any combination if multiple are active).
 
 ```
 STOP
-→ LOG stopped
+→ POLL stopped
 
 STOP
-→ POLL and LOG stopped
+→ SLAVE stopped
 
 STOP
-→ POLL and SLAVE and FILTER and LOG stopped
+→ POLL and SLAVE and FILTER stopped
 
 STOP
 → Nothing running

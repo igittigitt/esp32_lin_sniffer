@@ -264,7 +264,7 @@ static const char TERMINAL_HTML[] =
 "      if(r.ok){"
 "        clearInterval(timer);"
 "        appendLine('# Device rebooted - reloading page...','info');"
-"        setTimeout(()=>location.reload(),500);"
+"        setTimeout(()=>window.location.href=window.location.href.split('?')[0]+'?t='+Date.now(),500);"
 "      }"
 "    }catch(e){ /* noch nicht erreichbar, weiter warten */ }"
 "    if(attempts>=max){"

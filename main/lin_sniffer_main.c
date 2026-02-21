@@ -133,7 +133,6 @@ static struct {
 } filter_state = {0};
 
 // ── SCAN state ────────────────────────────────────────────────────
-static volatile bool scan_active = false;
 
 // ── LOG state ─────────────────────────────────────────────────────
 typedef enum {
@@ -141,13 +140,7 @@ typedef enum {
     LOG_FORMAT_HUMAN
 } log_format_t;
 
-static struct {
-    volatile bool active;
-    log_format_t  format;
-} log_state = {
-    .active = false,
-    .format = LOG_FORMAT_HUMAN  // Default format
-};
+static log_format_t current_format = LOG_FORMAT_HUMAN;  // Default format
 
 // ═══════════════════════════════════════════════════════════════════
 // Prototypes
@@ -167,18 +160,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 void    wifi_start_ap(void);
 void    wifi_connect_sta(const char *ssid, const char *password);
 void    wifi_init(void);
-static bool scan_request(uart_port_t uart_num, uint8_t id, uint8_t *buf, uint8_t *out_len);
-static void lin_scan_bus(uart_port_t uart_num, int sock);
-void    parse_command(char *cmd, int sock);
-void    uart_event_task(void *pvParameters);
-void    client_handler_task(void *pvParameters);
-void    tcp_server_task(void *pvParameters);
-void    poll_task(void *pvParameters);
-static void slave_sim_respond(uint8_t id);
-static bool filter_check(uint8_t id);
+
 
 // ═══════════════════════════════════════════════════════════════════
-// Helper Functions
+// Ring Buffer for broadcasting to all clients
 // ═══════════════════════════════════════════════════════════════════
 
 void broadcast_to_clients(const char *message, int len)
@@ -187,8 +172,7 @@ void broadcast_to_clients(const char *message, int len)
     ringbuf_push(message);
 }
 
-
-// Format a frame according to log_state.format, write to buffer
+// Format a frame according to current_format, write to buffer
 static int format_frame(char *buf, size_t buf_size, uint8_t id, 
                        const uint8_t *data, uint8_t len,
                        lin_checksum_type_t checksum_type, 
@@ -196,7 +180,7 @@ static int format_frame(char *buf, size_t buf_size, uint8_t id,
 {
     int pos = 0;
 
-    if (log_state.format == LOG_FORMAT_CANDUMP) {
+    if (current_format == LOG_FORMAT_CANDUMP) {
         // candump format
         double timestamp_sec = (timestamp_us - boot_timestamp_us) / 1000000.0;
         pos = snprintf(buf, buf_size, "(%.6f) lin0 %03X#", timestamp_sec, id);
@@ -213,33 +197,38 @@ static int format_frame(char *buf, size_t buf_size, uint8_t id,
         pos += snprintf(buf + pos, buf_size - pos, "\r\n");
         
     } else {  // LOG_FORMAT_HUMAN
-        // Human format: ID | Data Bytes                      CRC | ASCII    |
-        char data_str[32] = "";
-        char crc_str[4] = "---";
-        char ascii_str[9] = "--------";
+        // Human format: Timestamp | ID | Data Bytes                      CRC | ASCII    |
+        double timestamp_sec = (timestamp_us - boot_timestamp_us) / 1000000.0;
+        char data_str[32];
+        char crc_str[4];
+        char ascii_str[9];
         
         if (data && len > 0) {
+            // Build data bytes string (no padding needed)
             int dpos = 0;
             for (int i = 0; i < len && i < 8; i++) {
                 dpos += snprintf(data_str + dpos, sizeof(data_str) - dpos, "%02X ", data[i]);
             }
-            // Pad to 24 chars
-            while (dpos < 24) data_str[dpos++] = ' ';
-            data_str[24] = '\0';
+            data_str[dpos] = '\0';
             
             snprintf(crc_str, sizeof(crc_str), "%s", 
                      (checksum_type == LIN_CHECKSUM_CLASSIC) ? "CLA" : "ENH");
             
+            // Build ASCII string
             for (int i = 0; i < len && i < 8; i++) {
                 ascii_str[i] = (data[i] >= 0x20 && data[i] < 0x7F) ? data[i] : '.';
             }
             ascii_str[len < 8 ? len : 8] = '\0';
         } else {
-            snprintf(data_str, sizeof(data_str), "%-24s", "UNANSWERED");
+            // UNANSWERED
+            strcpy(data_str, "UNANSWERED");
+            strcpy(crc_str, "---");
+            ascii_str[0] = '\0';
         }
         
-        pos = snprintf(buf, buf_size, "%02X | %s %s | %-8s |\r\n",
-                      id, data_str, crc_str, ascii_str);
+        // Fixed-width columns via format string
+        pos = snprintf(buf, buf_size, "%10.3f | %02X | %-24s | %-3s | %-8s |\r\n",
+                      timestamp_sec, id, data_str, crc_str, ascii_str);
     }
     
     return pos;
@@ -249,8 +238,6 @@ void output_frame(uint8_t id, const uint8_t *data, uint8_t len,
                  lin_checksum_type_t checksum_type, uint64_t timestamp_us,
                  const char *label)
 {
-    if (!log_state.active) return;  // Logging disabled
-    
     char buf[128];
     int pos = format_frame(buf, sizeof(buf), id, data, len, checksum_type, timestamp_us, label);
     broadcast_to_clients(buf, pos);
@@ -262,23 +249,27 @@ void output_frame(uint8_t id, const uint8_t *data, uint8_t len,
 // LIN RX Callback
 // ═══════════════════════════════════════════════════════════════════
 
+// Returns true if ID should be shown (no filter active OR ID is in list)
+static bool filter_check(uint8_t id)
+{
+    if (!filter_state.active) return true;
+    for (int i = 0; i < filter_state.count; i++) {
+        if (filter_state.ids[i] == id) return true;
+    }
+    return false;
+}
+
 void lin_rx_callback(uint8_t id, const uint8_t *data, uint8_t len,
                     lin_checksum_type_t checksum_type, uint64_t timestamp_us,
                     void *user_data)
 {
-    // Skip output during SCAN (SCAN reads directly from UART)
-    if (scan_active) return;
-    
     // Filter check: skip if not in allowed list
     if (!filter_check(id)) return;
 
 
     if (data == NULL || len == 0) {
-        char buf[64];
-        double timestamp_sec = (timestamp_us - boot_timestamp_us) / 1000000.0;
-        int pos = snprintf(buf, sizeof(buf), "(%.6f) lin0 %03X# # UNANSWERED\r\n",
-                          timestamp_sec, id);
-        broadcast_to_clients(buf, pos);
+        // UNANSWERED frames - use output_frame to respect log format
+        output_frame(id, NULL, 0, checksum_type, timestamp_us, "RX");
     } else {
         led_indicator_send(LED_EVENT_LIN_RX);
         output_frame(id, data, len, checksum_type, timestamp_us, "RX");
@@ -329,139 +320,38 @@ bool wifi_set_credentials(const char *ssid, const char *password)
 // ═══════════════════════════════════════════════════════════════════
 // LIN Scanner
 // ═══════════════════════════════════════════════════════════════════
-
-static bool scan_request(uart_port_t uart_num, uint8_t id,
-                         uint8_t *buf, uint8_t *out_len)
-{
-    uart_flush_input(uart_num);
-    lin_send_header(uart_num, id);
-    led_indicator_send(LED_EVENT_LIN_TX);
-
-    vTaskDelay(pdMS_TO_TICKS(SCAN_RESPONSE_MS));
-
-    int len = uart_read_bytes(uart_num, buf, LIN_MAX_DATA_LEN + 1, pdMS_TO_TICKS(5));
-    if (len > 1) {
-        *out_len = len - 1;
-        return true;
-    }
-    *out_len = 0;
-    return false;
-}
+// LIN Scanner
+// ═══════════════════════════════════════════════════════════════════
 
 static void lin_scan_bus(uart_port_t uart_num, int sock)
 {
     char line[256];
     int  pos;
-    int  found = 0;
-
-    scan_active = true;  // Disable candump output during scan
 
     pos = snprintf(line, sizeof(line), "\r\n+++ LIN Bus Scan  (0x00 - 0x3F) +++\r\n");
     broadcast_to_clients(line, pos);
+    
+    pos = snprintf(line, sizeof(line), "Scanning IDs 0x00-0x3F...\r\n");
+    broadcast_to_clients(line, pos);
 
+    // Simply send headers - normal LOG will show responses
     for (uint8_t id = 0x00; id <= 0x3F; id++) {
-        uint8_t buf[LIN_MAX_DATA_LEN + 1];
-        uint8_t buf_len = 0;
-
-        bool got_response = scan_request(uart_num, id, buf, &buf_len);
-        
-        if (got_response) {
-            found++;
-        }
-
-        bool is_multiframe = got_response && (buf_len == 8 && buf[0] >= 0x01 && buf[0] <= 0x0F);
-
-        if (!is_multiframe) {
-            // Format frame according to current log_state.format and send directly
-            uint64_t ts = esp_timer_get_time();
-            pos = format_frame(line, sizeof(line), id, 
-                             got_response ? buf : NULL, 
-                             got_response ? buf_len : 0, 
-                             LIN_CHECKSUM_CLASSIC, ts, "SCAN");
-            // Use broadcast (ring buffer) instead of CMD_SEND to avoid WS buffer overflow
-            broadcast_to_clients(line, pos);
-            vTaskDelay(pdMS_TO_TICKS(10));  // Small delay for output to flush
-        } else {
-            uint8_t mf_data[SCAN_MAX_BLOCKS][LIN_MAX_DATA_LEN];
-            uint8_t mf_len[SCAN_MAX_BLOCKS];
-            uint8_t mf_count = 0;
-            uint8_t first_counter = buf[0];
-
-            memcpy(mf_data[mf_count], buf, buf_len);
-            mf_len[mf_count] = buf_len;
-            mf_count++;
-
-            for (int attempt = 0; attempt < SCAN_MAX_BLOCKS - 1; attempt++) {
-                vTaskDelay(pdMS_TO_TICKS(SCAN_INTER_FRAME_MS));
-                uint8_t nb[LIN_MAX_DATA_LEN + 1];
-                uint8_t nb_len = 0;
-                if (!scan_request(uart_num, id, nb, &nb_len)) break;
-                if (nb_len < 1) break;
-                if (nb[0] == first_counter) break;
-                memcpy(mf_data[mf_count], nb, nb_len);
-                mf_len[mf_count] = nb_len;
-                mf_count++;
-            }
-
-            pos = snprintf(line, sizeof(line),
-                "  0x%02X  MULTIFRAME  (%d Blöcke)\r\n", id, mf_count);
-            CMD_SEND(sock, line, pos);
-
-            char assembled[64] = {0};
-            int  asm_pos = 0;
-
-            for (int b = 0; b < mf_count; b++) {
-                pos = snprintf(line, sizeof(line), "         Block %02d: ", mf_data[b][0]);
-                for (int i = 1; i < mf_len[b]; i++) {
-                    pos += snprintf(line + pos, sizeof(line) - pos, "%02X ", mf_data[b][i]);
-                    if (mf_data[b][i] != 0x00 && asm_pos < (int)sizeof(assembled) - 1) {
-                        assembled[asm_pos++] =
-                            (mf_data[b][i] >= 0x20 && mf_data[b][i] < 0x7F)
-                            ? mf_data[b][i] : '.';
-                    }
-                }
-                pos += snprintf(line + pos, sizeof(line) - pos, "\r\n");
-                CMD_SEND(sock, line, pos);
-            }
-
-            if (asm_pos > 0) {
-                assembled[asm_pos] = '\0';
-                if (asm_pos >= 10 && asm_pos <= 12) {
-                    pos = snprintf(line, sizeof(line),
-                        "         → Part#: \"%.4s-%.6s-%.2s\"\r\n",
-                        assembled, assembled + 4, assembled + 10);
-                } else {
-                    pos = snprintf(line, sizeof(line),
-                        "         → ASCII: \"%s\"\r\n", assembled);
-                }
-                CMD_SEND(sock, line, pos);
-            }
-        }
-
+        lin_send_header(uart_num, id);
+        led_indicator_send(LED_EVENT_LIN_TX);
         vTaskDelay(pdMS_TO_TICKS(SCAN_INTER_FRAME_MS));
     }
 
     pos = snprintf(line, sizeof(line),
         "══════════════════════════════════════════\r\n"
-        "Scan complete. %d frame ID(s) found.\r\n\r\n", found);
+        "Scan complete.\r\n\r\n");
     broadcast_to_clients(line, pos);
-    
-    scan_active = false;  // Re-enable candump output
 }
+
 
 // ═══════════════════════════════════════════════════════════════════
 // Filter
 // ═══════════════════════════════════════════════════════════════════
 
-// Returns true if ID should be shown (no filter active OR ID is in list)
-static bool filter_check(uint8_t id)
-{
-    if (!filter_state.active) return true;
-    for (int i = 0; i < filter_state.count; i++) {
-        if (filter_state.ids[i] == id) return true;
-    }
-    return false;
-}
 
 // ═══════════════════════════════════════════════════════════════════
 // Slave Simulation
@@ -726,19 +616,16 @@ void parse_command(char *cmd, int sock)
         bool stopped_poll   = poll_state.active;
         bool stopped_slave  = slave_state.active;
         bool stopped_filter = filter_state.active;
-        bool stopped_log    = log_state.active;
 
         if (stopped_poll)   poll_stop();
         if (stopped_slave)  slave_state.active = false;
         if (stopped_filter) filter_state.active = false;
-        if (stopped_log)    log_state.active = false;
 
         char msg[128] = "";
         int n = 0;
         if (stopped_poll)   n += snprintf(msg + n, sizeof(msg) - n, "POLL");
         if (stopped_slave)  n += snprintf(msg + n, sizeof(msg) - n, "%sSLAVE", n?" and ":"");
         if (stopped_filter) n += snprintf(msg + n, sizeof(msg) - n, "%sFILTER", n?" and ":"");
-        if (stopped_log)    n += snprintf(msg + n, sizeof(msg) - n, "%sLOG", n?" and ":"");
 
         if (n > 0)
             snprintf(response, sizeof(response), "%s stopped\r\n", msg);
@@ -775,12 +662,10 @@ void parse_command(char *cmd, int sock)
         }
         
         if (strcmp(format_str, "CANDUMP") == 0) {
-            log_state.format = LOG_FORMAT_CANDUMP;
-            log_state.active = true;
+            current_format = LOG_FORMAT_CANDUMP;
             snprintf(response, sizeof(response), "LOG started: CANDUMP format\r\n");
         } else if (strcmp(format_str, "HUMAN") == 0) {
-            log_state.format = LOG_FORMAT_HUMAN;
-            log_state.active = true;
+            current_format = LOG_FORMAT_HUMAN;
             snprintf(response, sizeof(response), "LOG started: HUMAN format\r\n");
         } else {
             snprintf(response, sizeof(response), "ERROR: LOG CANDUMP | LOG HUMAN\r\n");
@@ -812,8 +697,8 @@ void parse_command(char *cmd, int sock)
             "  POLL <ID> <ms> [<N>|<N>s]    - Poll ID every N ms (count or duration)\r\n"
             "  SLAVE <ID> <data>            - Simulate LIN slave response\r\n"
             "  FILTER <ID> [<ID>...]        - Show only specified IDs\r\n"
-            "  LOG CANDUMP | LOG HUMAN      - Start logging in specified format\r\n"
-            "  STOP                         - Stop POLL/SLAVE/FILTER/LOG\r\n"
+            "  FORMAT CANDUMP | FORMAT HUMAN - Set output format\r\n"
+            "  STOP                         - Stop POLL/SLAVE/FILTER\r\n"
             "  SCAN                         - Scan all IDs 0x00-0x3F\r\n"
             "  WIFI <SSID> <PW>             - Set WiFi credentials and reboot\r\n"
             "  REBOOT                       - Restart device\r\n"
