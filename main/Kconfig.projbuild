@@ -67,9 +67,9 @@ menu "LIN Sniffer Configuration"
         config TCP_PORT
             int "TCP server port"
             default 23
-            range 21 65535
+            range 1 65535
             help
-                Port for TCP server (use with putty or netcat).
+                Port for TCP server (telnet standard port is 23).
         
         config MAX_TCP_CLIENTS
             int "Maximum TCP clients"
@@ -77,6 +77,20 @@ menu "LIN Sniffer Configuration"
             range 1 10
             help
                 Maximum number of simultaneous TCP connections.
+    
+    endmenu
+    
+    menu "WebSocket Configuration"
+    
+        config WS_RECONNECT_HISTORY_LINES
+            int "Reconnect history lines"
+            default 50
+            range 0 200
+            help
+                Number of recent log lines sent to WebSocket clients on reconnect.
+                When a client disconnects and reconnects, they receive the last N
+                messages from the ring buffer to see what they missed.
+                Set to 0 to disable history replay on reconnect.
     
     endmenu
 

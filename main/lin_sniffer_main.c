@@ -653,26 +653,6 @@ void parse_command(char *cmd, int sock)
         CMD_SEND(sock, response, strlen(response));
     }
 
-    // LOG <format>
-    else if (strncmp(cmd, "LOG ", 4) == 0) {
-        char *format_str = cmd + 4;
-        // Convert format to uppercase for comparison
-        for (char *p = format_str; *p; p++) {
-            *p = (char)toupper((unsigned char)*p);
-        }
-        
-        if (strcmp(format_str, "CANDUMP") == 0) {
-            current_format = LOG_FORMAT_CANDUMP;
-            snprintf(response, sizeof(response), "LOG started: CANDUMP format\r\n");
-        } else if (strcmp(format_str, "HUMAN") == 0) {
-            current_format = LOG_FORMAT_HUMAN;
-            snprintf(response, sizeof(response), "LOG started: HUMAN format\r\n");
-        } else {
-            snprintf(response, sizeof(response), "ERROR: LOG CANDUMP | LOG HUMAN\r\n");
-        }
-        CMD_SEND(sock, response, strlen(response));
-    }
-
     // REBOOT
     else if (strcmp(cmd, "REBOOT") == 0) {
         snprintf(response, sizeof(response), "Rebooting...\r\n");
@@ -686,6 +666,26 @@ void parse_command(char *cmd, int sock)
         snprintf(response, sizeof(response), "Scanning IDs 0x00-0x3F...\r\n");
         broadcast_to_clients(response, strlen(response));
         lin_scan_bus(UART_NUM, sock);
+    }
+
+    // FORMAT <type>
+    else if (strncmp(cmd, "FORMAT ", 7) == 0) {
+        char *format_str = cmd + 7;
+        // Convert format to uppercase for comparison
+        for (char *p = format_str; *p; p++) {
+            *p = (char)toupper((unsigned char)*p);
+        }
+        
+        if (strcmp(format_str, "CANDUMP") == 0) {
+            current_format = LOG_FORMAT_CANDUMP;
+            snprintf(response, sizeof(response), "Format: CANDUMP\r\n");
+        } else if (strcmp(format_str, "HUMAN") == 0) {
+            current_format = LOG_FORMAT_HUMAN;
+            snprintf(response, sizeof(response), "Format: HUMAN\r\n");
+        } else {
+            snprintf(response, sizeof(response), "ERROR: FORMAT CANDUMP | FORMAT HUMAN\r\n");
+        }
+        CMD_SEND(sock, response, strlen(response));
     }
 
     // HELP
@@ -769,7 +769,7 @@ void client_handler_task(void *pvParameters)
     int sock = (int)pvParameters;
 
     ringbuf_reader_t reader;
-    ringbuf_reader_init_from_history(&reader, 50);
+    ringbuf_reader_init_from_history(&reader, CONFIG_WS_RECONNECT_HISTORY_LINES);
 
     struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));

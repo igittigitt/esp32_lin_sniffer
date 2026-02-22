@@ -108,7 +108,7 @@ static const char TERMINAL_HTML[] =
 "</div>"
 "<div id='log'></div>"
 "<div id='inputbar'>"
-"  <input id='cmd' type='text' placeholder='Command (e.g. HEADER 0E, SCAN, HELP)' autocomplete='off' spellcheck='false' />"
+"  <input id='cmd' type='text' placeholder='Command (e.g. HEADER 0E, SCAN, HELP)' autocomplete='off' spellcheck='false' autofocus />"
 "  <button onclick='sendCmd()'>Send</button>"
 "  <button onclick='clearLog()' style='background:#444'>Clear</button>"
 "  <button onclick='copyLog()' style='background:#444'>Copy</button>"
@@ -388,7 +388,7 @@ static void ws_client_add(int fd)
     for (int i = 0; i < WS_MAX_CLIENTS; i++) {
         if (s_ws_clients[i].fd == -1) {
             s_ws_clients[i].fd = fd;
-            ringbuf_reader_init_from_history(&s_ws_clients[i].reader, 50);
+            ringbuf_reader_init_from_history(&s_ws_clients[i].reader, CONFIG_WS_RECONNECT_HISTORY_LINES);
             ESP_LOGI(TAG, "WS Client %d connected (slot %d)", fd, i);
             break;
         }
