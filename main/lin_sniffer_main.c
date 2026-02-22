@@ -458,7 +458,7 @@ void parse_command(char *cmd, int sock)
     if (strncmp(cmd, "HEADER ", 7) == 0) {
         uint8_t id = (uint8_t)strtol(cmd + 7, NULL, 16);
         if (id > 0x3F) {
-            snprintf(response, sizeof(response), "ERROR: ID must be 0x00-0x3F\r\n");
+            snprintf(response, sizeof(response), "# ERROR: ID must be 0x00-0x3F\r\n");
             CMD_SEND(sock, response, strlen(response));
             return;
         }
@@ -467,7 +467,7 @@ void parse_command(char *cmd, int sock)
             snprintf(response, sizeof(response),
                      "HEADER sent for ID 0x%02X - watch for RX response\r\n", id);
         } else {
-            snprintf(response, sizeof(response), "ERROR\r\n");
+            snprintf(response, sizeof(response), "# ERROR\r\n");
         }
         CMD_SEND(sock, response, strlen(response));
     }
@@ -477,7 +477,7 @@ void parse_command(char *cmd, int sock)
         lin_frame_t frame = { .checksum_type = LIN_CHECKSUM_CLASSIC };
         char *token = strtok(cmd + 5, " ");
         if (!token) {
-            snprintf(response, sizeof(response), "ERROR: SEND <ID> <data>\r\n");
+            snprintf(response, sizeof(response), "# ERROR: SEND <ID> <data>\r\n");
             CMD_SEND(sock, response, strlen(response));
             return;
         }
@@ -489,9 +489,9 @@ void parse_command(char *cmd, int sock)
             led_indicator_send(LED_EVENT_LIN_TX);
             output_frame(frame.id, frame.data, frame.len,
                           frame.checksum_type, esp_timer_get_time(), "TX");
-            snprintf(response, sizeof(response), "OK\r\n");
+            snprintf(response, sizeof(response), "# OK\r\n");
         } else {
-            snprintf(response, sizeof(response), "ERROR\r\n");
+            snprintf(response, sizeof(response), "# ERROR\r\n");
         }
         CMD_SEND(sock, response, strlen(response));
     }
@@ -524,10 +524,10 @@ void parse_command(char *cmd, int sock)
             }
 
             if (id > 0x3F) {
-                snprintf(response, sizeof(response), "ERROR: ID must be 0x00-0x3F\r\n");
+                snprintf(response, sizeof(response), "# ERROR: ID must be 0x00-0x3F\r\n");
                 CMD_SEND(sock, response, strlen(response));
             } else if (period_ms < 10) {
-                snprintf(response, sizeof(response), "ERROR: period_ms must be >= 10\r\n");
+                snprintf(response, sizeof(response), "# ERROR: period_ms must be >= 10\r\n");
                 CMD_SEND(sock, response, strlen(response));
             } else {
                 poll_stop();  // Alten POLL stoppen falls aktiv
@@ -555,7 +555,7 @@ void parse_command(char *cmd, int sock)
         while (token && count < 64) {
             uint8_t id = (uint8_t)strtol(token, NULL, 16);
             if (id > 0x3F) {
-                snprintf(response, sizeof(response), "ERROR: ID 0x%02X out of range\r\n", id);
+                snprintf(response, sizeof(response), "# ERROR: ID 0x%02X out of range\r\n", id);
                 CMD_SEND(sock, response, strlen(response));
                 return;
             }
@@ -564,7 +564,7 @@ void parse_command(char *cmd, int sock)
         }
 
         if (count == 0) {
-            snprintf(response, sizeof(response), "ERROR: FILTER <ID> [<ID> ...]\r\n");
+            snprintf(response, sizeof(response), "# ERROR: FILTER <ID> [<ID> ...]\r\n");
             CMD_SEND(sock, response, strlen(response));
         } else {
             // Atomic update
@@ -573,7 +573,7 @@ void parse_command(char *cmd, int sock)
             memcpy(filter_state.ids, ids, count);
             filter_state.active = true;
 
-            snprintf(response, sizeof(response), "FILTER active: %d ID(s)\r\n", count);
+            snprintf(response, sizeof(response), "# FILTER active: %d ID(s)\r\n", count);
             CMD_SEND(sock, response, strlen(response));
         }
     }
@@ -582,7 +582,7 @@ void parse_command(char *cmd, int sock)
     else if (strncmp(cmd, "SLAVE ", 6) == 0) {
         char *token = strtok(cmd + 6, " ");
         if (!token) {
-            snprintf(response, sizeof(response), "ERROR: SLAVE <ID> <byte> ...\r\n");
+            snprintf(response, sizeof(response), "# ERROR: SLAVE <ID> <byte> ...\r\n");
             CMD_SEND(sock, response, strlen(response));
         } else {
             uint8_t id  = (uint8_t)strtol(token, NULL, 16);
@@ -594,9 +594,9 @@ void parse_command(char *cmd, int sock)
             }
 
             if (id > 0x3F) {
-                snprintf(response, sizeof(response), "ERROR: ID must be 0x00-0x3F\r\n");
+                snprintf(response, sizeof(response), "# ERROR: ID must be 0x00-0x3F\r\n");
             } else if (len == 0) {
-                snprintf(response, sizeof(response), "ERROR: at least 1 data byte required\r\n");
+                snprintf(response, sizeof(response), "# ERROR: at least 1 data byte required\r\n");
             } else {
                 // Activate - atomic update
                 slave_state.active   = false;  // pause before update
@@ -628,9 +628,9 @@ void parse_command(char *cmd, int sock)
         if (stopped_filter) n += snprintf(msg + n, sizeof(msg) - n, "%sFILTER", n?" and ":"");
 
         if (n > 0)
-            snprintf(response, sizeof(response), "%s stopped\r\n", msg);
+            snprintf(response, sizeof(response), "# %s stopped\r\n", msg);
         else
-            snprintf(response, sizeof(response), "Nothing running\r\n");
+            snprintf(response, sizeof(response), "# Nothing running\r\n");
 
         CMD_SEND(sock, response, strlen(response));
     }
@@ -640,22 +640,22 @@ void parse_command(char *cmd, int sock)
         char *ssid     = strtok(cmd + 5, " ");
         char *password = strtok(NULL, " ");
         if (!ssid || !password) {
-            snprintf(response, sizeof(response), "ERROR: WIFI <SSID> <PASSWORD>\r\n");
+            snprintf(response, sizeof(response), "# ERROR: WIFI <SSID> <PASSWORD>\r\n");
         } else if (wifi_set_credentials(ssid, password)) {
-            snprintf(response, sizeof(response), "OK: Rebooting...\r\n");
+            snprintf(response, sizeof(response), "# OK: Rebooting...\r\n");
             CMD_SEND(sock, response, strlen(response));
             vTaskDelay(pdMS_TO_TICKS(500));
             esp_restart();
             return;
         } else {
-            snprintf(response, sizeof(response), "ERROR\r\n");
+            snprintf(response, sizeof(response), "# ERROR\r\n");
         }
         CMD_SEND(sock, response, strlen(response));
     }
 
     // REBOOT
     else if (strcmp(cmd, "REBOOT") == 0) {
-        snprintf(response, sizeof(response), "Rebooting...\r\n");
+        snprintf(response, sizeof(response), "# Rebooting...\r\n");
         CMD_SEND(sock, response, strlen(response));
         vTaskDelay(pdMS_TO_TICKS(1000));
         esp_restart();
@@ -663,7 +663,7 @@ void parse_command(char *cmd, int sock)
 
     // SCAN
     else if (strcmp(cmd, "SCAN") == 0) {
-        snprintf(response, sizeof(response), "Scanning IDs 0x00-0x3F...\r\n");
+        snprintf(response, sizeof(response), "# Scanning IDs 0x00-0x3F...\r\n");
         broadcast_to_clients(response, strlen(response));
         lin_scan_bus(UART_NUM, sock);
     }
@@ -678,12 +678,12 @@ void parse_command(char *cmd, int sock)
         
         if (strcmp(format_str, "CANDUMP") == 0) {
             current_format = LOG_FORMAT_CANDUMP;
-            snprintf(response, sizeof(response), "Format: CANDUMP\r\n");
+            snprintf(response, sizeof(response), "# Format: CANDUMP\r\n");
         } else if (strcmp(format_str, "HUMAN") == 0) {
             current_format = LOG_FORMAT_HUMAN;
-            snprintf(response, sizeof(response), "Format: HUMAN\r\n");
+            snprintf(response, sizeof(response), "# Format: HUMAN\r\n");
         } else {
-            snprintf(response, sizeof(response), "ERROR: FORMAT CANDUMP | FORMAT HUMAN\r\n");
+            snprintf(response, sizeof(response), "# ERROR: FORMAT CANDUMP | FORMAT HUMAN\r\n");
         }
         CMD_SEND(sock, response, strlen(response));
     }
@@ -707,7 +707,7 @@ void parse_command(char *cmd, int sock)
     }
 
     else {
-        snprintf(response, sizeof(response), "ERROR: Type HELP\r\n");
+        snprintf(response, sizeof(response), "# ERROR: Type HELP\r\n");
         CMD_SEND(sock, response, strlen(response));
     }
 }
