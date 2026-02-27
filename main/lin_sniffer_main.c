@@ -702,8 +702,16 @@ void parse_command(char *cmd, int sock)
             "  SCAN                         - Scan all IDs 0x00-0x3F\r\n"
             "  WIFI <SSID> <PW>             - Set WiFi credentials and reboot\r\n"
             "  REBOOT                       - Restart device\r\n"
+            "  IDENTIFY                     - Show device type, version and buses\r\n"
             "  HELP                         - Show this help\r\n";
         CMD_SEND(sock, help_text, strlen(help_text));
+    }
+
+    // IDENTIFY
+    else if (strcmp(cmd, "IDENTIFY") == 0) {
+        snprintf(response, sizeof(response),
+                 "# Type: LIN, Version: " LIN_SNIFFER_VERSION ", Buses: " LIN_BUS_NAMES "\r\n");
+        CMD_SEND(sock, response, strlen(response));
     }
 
     else {
