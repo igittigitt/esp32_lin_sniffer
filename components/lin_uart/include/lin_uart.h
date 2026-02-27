@@ -48,6 +48,10 @@ extern "C" {
 #define LIN_DELIMITER_BITS       1    // bit-times for BREAK delimiter (UART method only)
 #define LIN_INTERBYTE_SPACE_US 100    // µs pause between bytes
 
+// LIN Wakeup Timing (LIN 2.2A §2.6)
+#define LIN_WAKEUP_PULSE_US    500    // dominant pulse: 250µs–5ms, we use 500µs
+#define LIN_WAKEUP_WAIT_MS     100    // min. wait after pulse for slaves to initialize
+
 // ═══════════════════════════════════════════════════════════════════
 // Types
 // ═══════════════════════════════════════════════════════════════════
@@ -147,6 +151,15 @@ esp_err_t lin_send_frame(uart_port_t uart_num, const lin_frame_t *frame);
 
 /** @brief Send header only (Master request): BREAK + SYNC + PID */
 esp_err_t lin_send_header(uart_port_t uart_num, uint8_t id);
+
+/**
+ * @brief Send LIN wakeup pulse (LIN 2.2A §2.6)
+ *
+ * Pulls TX dominant for LIN_WAKEUP_PULSE_US (500µs), then releases.
+ * The caller is responsible for waiting LIN_WAKEUP_WAIT_MS (100ms)
+ * before sending the first frame.
+ */
+void lin_send_wakeup(uart_port_t uart_num);
 
 // ═══════════════════════════════════════════════════════════════════
 // RX Parser Functions

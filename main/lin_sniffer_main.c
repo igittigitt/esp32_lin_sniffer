@@ -114,8 +114,24 @@ static struct {
     uint32_t      period_ms;    // interval between headers
     uint32_t      count;        // 0 = endless, >0 = N times
     uint32_t      duration_ms;  // 0 = use count, >0 = run for N ms
+    bool          wake;         // send wakeup pulse before first frame
     int           sock;         // client socket for status messages
 } poll_state = {0};
+
+// ── SEND-loop state ──────────────────────────────────────────────
+static struct {
+    volatile bool active;
+    volatile bool stop;
+    TaskHandle_t  task_handle;
+    uint8_t       id;
+    uint8_t       data[LIN_MAX_DATA_LEN];
+    uint8_t       data_len;
+    uint32_t      period_ms;
+    uint32_t      count;        // 0 = endless, >0 = N times
+    uint32_t      duration_ms;  // 0 = use count, >0 = run for N ms
+    bool          wake;         // send wakeup pulse before first frame
+    int           sock;
+} send_loop_state = {0};
 
 // ── SLAVE simulation state ────────────────────────────────────────
 static struct {
@@ -393,6 +409,15 @@ void poll_task(void *pvParameters)
                         ? (uint64_t)poll_state.duration_ms * 1000
                         : 0;
 
+    if (poll_state.wake) {
+        snprintf(buf, sizeof(buf), "# WAKE: sending wakeup pulse...\r\n");
+        CMD_SEND(poll_state.sock, buf, strlen(buf));
+        lin_send_wakeup(UART_NUM);
+        vTaskDelay(pdMS_TO_TICKS(LIN_WAKEUP_WAIT_MS));
+        snprintf(buf, sizeof(buf), "# WAKE: slaves ready\r\n");
+        CMD_SEND(poll_state.sock, buf, strlen(buf));
+    }
+
     snprintf(buf, sizeof(buf), "POLL started: ID=0x%02X period=%lums%s\r\n",
              poll_state.id, poll_state.period_ms,
              (poll_state.count > 0)      ? " (count limit)" :
@@ -423,6 +448,70 @@ static void poll_stop(void)
     if (!poll_state.active) return;
     poll_state.stop = true;
     uint32_t wait_ms = poll_state.period_ms * 2 + 100;
+    vTaskDelay(pdMS_TO_TICKS(wait_ms));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SEND-loop Task
+// ═══════════════════════════════════════════════════════════════════
+
+void send_loop_task(void *pvParameters)
+{
+    char buf[64];
+    uint32_t count    = 0;
+    uint64_t start_us = esp_timer_get_time();
+    uint64_t limit_us = (send_loop_state.duration_ms > 0)
+                        ? (uint64_t)send_loop_state.duration_ms * 1000
+                        : 0;
+
+    if (send_loop_state.wake) {
+        snprintf(buf, sizeof(buf), "# WAKE: sending wakeup pulse...\r\n");
+        CMD_SEND(send_loop_state.sock, buf, strlen(buf));
+        lin_send_wakeup(UART_NUM);
+        vTaskDelay(pdMS_TO_TICKS(LIN_WAKEUP_WAIT_MS));
+        snprintf(buf, sizeof(buf), "# WAKE: slaves ready\r\n");
+        CMD_SEND(send_loop_state.sock, buf, strlen(buf));
+    }
+
+    snprintf(buf, sizeof(buf), "# SEND loop started: ID=0x%02X period=%lums%s\r\n",
+             send_loop_state.id, send_loop_state.period_ms,
+             (send_loop_state.count > 0)       ? " (count limit)" :
+             (send_loop_state.duration_ms > 0) ? " (time limit)"  : " (endless)");
+    CMD_SEND(send_loop_state.sock, buf, strlen(buf));
+
+    lin_frame_t frame = {
+        .id            = send_loop_state.id,
+        .len           = send_loop_state.data_len,
+        .checksum_type = LIN_CHECKSUM_CLASSIC,
+    };
+    memcpy(frame.data, send_loop_state.data, send_loop_state.data_len);
+
+    while (!send_loop_state.stop) {
+        if (send_loop_state.count > 0 && count >= send_loop_state.count) break;
+        if (limit_us > 0 && (esp_timer_get_time() - start_us) >= limit_us) break;
+
+        if (lin_send_frame(UART_NUM, &frame) == ESP_OK) {
+            led_indicator_send(LED_EVENT_LIN_TX);
+            output_frame(frame.id, frame.data, frame.len,
+                         frame.checksum_type, esp_timer_get_time(), "TX");
+        }
+        count++;
+        vTaskDelay(pdMS_TO_TICKS(send_loop_state.period_ms));
+    }
+
+    snprintf(buf, sizeof(buf), "# SEND loop stopped: %lu frames sent\r\n", count);
+    CMD_SEND(send_loop_state.sock, buf, strlen(buf));
+
+    send_loop_state.active      = false;
+    send_loop_state.task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void send_loop_stop(void)
+{
+    if (!send_loop_state.active) return;
+    send_loop_state.stop = true;
+    uint32_t wait_ms = send_loop_state.period_ms * 2 + 100;
     vTaskDelay(pdMS_TO_TICKS(wait_ms));
 }
 
@@ -472,7 +561,7 @@ void parse_command(char *cmd, int sock)
         CMD_SEND(sock, response, strlen(response));
     }
 
-    // SEND <ID> <data>
+    // SEND <ID> <data> [WAKE] [EVERY <ms> [<N>|<N>s]] [WAKE]
     else if (strncmp(cmd, "SEND ", 5) == 0) {
         lin_frame_t frame = { .checksum_type = LIN_CHECKSUM_CLASSIC };
         char *token = strtok(cmd + 5, " ");
@@ -482,36 +571,120 @@ void parse_command(char *cmd, int sock)
             return;
         }
         frame.id = (uint8_t)strtol(token, NULL, 16);
-        while ((token = strtok(NULL, " ")) != NULL && frame.len < LIN_MAX_DATA_LEN) {
-            frame.data[frame.len++] = (uint8_t)strtol(token, NULL, 16);
+
+        char arg_every_ms[16]    = {0};
+        char arg_every_limit[16] = {0};
+        bool has_every = false;
+        bool has_wake  = false;
+
+        while ((token = strtok(NULL, " ")) != NULL) {
+            if (strcasecmp(token, "WAKE") == 0) {
+                has_wake = true;
+            } else if (strcasecmp(token, "EVERY") == 0) {
+                has_every = true;
+                char *t2 = strtok(NULL, " ");
+                char *t3 = strtok(NULL, " ");
+                char *t4 = strtok(NULL, " ");
+                if (t2 && strcasecmp(t2, "WAKE") == 0) { has_wake = true; t2 = NULL; }
+                if (t2) strncpy(arg_every_ms, t2, sizeof(arg_every_ms) - 1);
+                if (t3 && strcasecmp(t3, "WAKE") == 0) { has_wake = true; t3 = NULL; }
+                if (t3) strncpy(arg_every_limit, t3, sizeof(arg_every_limit) - 1);
+                if (t4 && strcasecmp(t4, "WAKE") == 0) has_wake = true;
+                break;
+            } else if (frame.len < LIN_MAX_DATA_LEN) {
+                frame.data[frame.len++] = (uint8_t)strtol(token, NULL, 16);
+            }
         }
-        if (lin_send_frame(UART_NUM, &frame) == ESP_OK) {
-            led_indicator_send(LED_EVENT_LIN_TX);
-            output_frame(frame.id, frame.data, frame.len,
-                          frame.checksum_type, esp_timer_get_time(), "TX");
-            snprintf(response, sizeof(response), "# OK\r\n");
+
+        if (frame.id > 0x3F) {
+            snprintf(response, sizeof(response), "# ERROR: ID must be 0x00-0x3F\r\n");
+            CMD_SEND(sock, response, strlen(response));
+            return;
+        }
+
+        if (!has_every) {
+            // Einzel-Send
+            if (has_wake) {
+                snprintf(response, sizeof(response), "# WAKE: sending wakeup pulse...\r\n");
+                CMD_SEND(sock, response, strlen(response));
+                lin_send_wakeup(UART_NUM);
+                vTaskDelay(pdMS_TO_TICKS(LIN_WAKEUP_WAIT_MS));
+                snprintf(response, sizeof(response), "# WAKE: slaves ready\r\n");
+                CMD_SEND(sock, response, strlen(response));
+            }
+            if (lin_send_frame(UART_NUM, &frame) == ESP_OK) {
+                led_indicator_send(LED_EVENT_LIN_TX);
+                output_frame(frame.id, frame.data, frame.len,
+                              frame.checksum_type, esp_timer_get_time(), "TX");
+                snprintf(response, sizeof(response), "# OK\r\n");
+            } else {
+                snprintf(response, sizeof(response), "# ERROR\r\n");
+            }
+            CMD_SEND(sock, response, strlen(response));
         } else {
-            snprintf(response, sizeof(response), "# ERROR\r\n");
+            uint32_t period_ms = (uint32_t)strtoul(arg_every_ms, NULL, 10);
+            uint32_t count  = 0;
+            uint32_t dur_ms = 0;
+
+            if (strlen(arg_every_limit) > 0) {
+                size_t l = strlen(arg_every_limit);
+                if (arg_every_limit[l - 1] == 's') {
+                    arg_every_limit[l - 1] = '\0';
+                    dur_ms = (uint32_t)strtoul(arg_every_limit, NULL, 10) * 1000;
+                } else {
+                    count = (uint32_t)strtoul(arg_every_limit, NULL, 10);
+                }
+            }
+
+            if (period_ms < 10) {
+                snprintf(response, sizeof(response), "# ERROR: period_ms must be >= 10\r\n");
+                CMD_SEND(sock, response, strlen(response));
+                return;
+            }
+
+            send_loop_stop();
+
+            send_loop_state.id          = frame.id;
+            send_loop_state.data_len    = frame.len;
+            memcpy(send_loop_state.data, frame.data, frame.len);
+            send_loop_state.period_ms   = period_ms;
+            send_loop_state.count       = count;
+            send_loop_state.duration_ms = dur_ms;
+            send_loop_state.wake        = has_wake;
+            send_loop_state.sock        = sock;
+            send_loop_state.stop        = false;
+            send_loop_state.active      = true;
+
+            xTaskCreate(send_loop_task, "send_loop", 2048, NULL, 6,
+                        &send_loop_state.task_handle);
         }
-        CMD_SEND(sock, response, strlen(response));
     }
 
-    // POLL <ID> <period_ms> [<count> | <N>s]
+    // POLL <ID> <period_ms> [<count> | <N>s] [WAKE]
     else if (strncmp(cmd, "POLL ", 5) == 0) {
         char arg_id[8]      = {0};
         char arg_period[16] = {0};
         char arg_limit[16]  = {0};
+        char arg_wake[8]    = {0};
 
-        int parsed = sscanf(cmd + 5, "%7s %15s %15s", arg_id, arg_period, arg_limit);
+        int parsed = sscanf(cmd + 5, "%7s %15s %15s %7s",
+                            arg_id, arg_period, arg_limit, arg_wake);
         if (parsed < 2) {
             snprintf(response, sizeof(response),
-                     "ERROR: POLL <ID> <period_ms> [<count> | <N>s]\r\n");
+                     "ERROR: POLL <ID> <period_ms> [<count> | <N>s] [WAKE]\r\n");
             CMD_SEND(sock, response, strlen(response));
         } else {
             uint8_t  id        = (uint8_t)strtol(arg_id, NULL, 16);
             uint32_t period_ms = (uint32_t)strtoul(arg_period, NULL, 10);
             uint32_t count     = 0;
             uint32_t dur_ms    = 0;
+
+            // WAKE can appear as 3rd arg (instead of limit) or 4th arg
+            bool do_wake = (strcasecmp(arg_wake, "WAKE") == 0);
+            if (parsed >= 3 && strcasecmp(arg_limit, "WAKE") == 0) {
+                do_wake = true;
+                arg_limit[0] = '\0';
+            }
 
             if (parsed >= 3 && strlen(arg_limit) > 0) {
                 size_t llen = strlen(arg_limit);
@@ -536,6 +709,7 @@ void parse_command(char *cmd, int sock)
                 poll_state.period_ms   = period_ms;
                 poll_state.count       = count;
                 poll_state.duration_ms = dur_ms;
+                poll_state.wake        = do_wake;
                 poll_state.sock        = sock;
                 poll_state.stop        = false;
                 poll_state.active      = true;
@@ -614,16 +788,19 @@ void parse_command(char *cmd, int sock)
 
     else if (strcmp(cmd, "STOP") == 0) {
         bool stopped_poll   = poll_state.active;
+        bool stopped_send   = send_loop_state.active;
         bool stopped_slave  = slave_state.active;
         bool stopped_filter = filter_state.active;
 
         if (stopped_poll)   poll_stop();
+        if (stopped_send)   send_loop_stop();
         if (stopped_slave)  slave_state.active = false;
         if (stopped_filter) filter_state.active = false;
 
         char msg[128] = "";
         int n = 0;
         if (stopped_poll)   n += snprintf(msg + n, sizeof(msg) - n, "POLL");
+        if (stopped_send)   n += snprintf(msg + n, sizeof(msg) - n, "%sSEND", n?" and ":"");
         if (stopped_slave)  n += snprintf(msg + n, sizeof(msg) - n, "%sSLAVE", n?" and ":"");
         if (stopped_filter) n += snprintf(msg + n, sizeof(msg) - n, "%sFILTER", n?" and ":"");
 
@@ -632,6 +809,16 @@ void parse_command(char *cmd, int sock)
         else
             snprintf(response, sizeof(response), "# Nothing running\r\n");
 
+        CMD_SEND(sock, response, strlen(response));
+    }
+
+    // WAKE
+    else if (strcmp(cmd, "WAKE") == 0) {
+        snprintf(response, sizeof(response), "# WAKE: sending wakeup pulse...\r\n");
+        CMD_SEND(sock, response, strlen(response));
+        lin_send_wakeup(UART_NUM);
+        vTaskDelay(pdMS_TO_TICKS(LIN_WAKEUP_WAIT_MS));
+        snprintf(response, sizeof(response), "# WAKE: slaves ready\r\n");
         CMD_SEND(sock, response, strlen(response));
     }
 
@@ -693,12 +880,14 @@ void parse_command(char *cmd, int sock)
         const char *help_text =
             "Available commands:\r\n"
             "  HEADER <ID>                  - Send LIN header, listen for response\r\n"
-            "  SEND <ID> <data>             - Send complete LIN frame\r\n"
-            "  POLL <ID> <ms> [<N>|<N>s]    - Poll ID every N ms (count or duration)\r\n"
+            "  SEND <ID> <data> [WAKE]      - Send complete LIN frame\r\n"
+            "  SEND <ID> <data> [WAKE] EVERY <ms> [<N>|<N>s] - Send frame repeatedly\r\n"
+            "  POLL <ID> <ms> [<N>|<N>s] [WAKE] - Poll ID every N ms\r\n"
+            "  WAKE                         - Send wakeup pulse, wait 100ms\r\n"
             "  SLAVE <ID> <data>            - Simulate LIN slave response\r\n"
             "  FILTER <ID> [<ID>...]        - Show only specified IDs\r\n"
             "  FORMAT CANDUMP | FORMAT HUMAN - Set output format\r\n"
-            "  STOP                         - Stop POLL/SLAVE/FILTER\r\n"
+            "  STOP                         - Stop POLL/SEND/SLAVE/FILTER\r\n"
             "  SCAN                         - Scan all IDs 0x00-0x3F\r\n"
             "  WIFI <SSID> <PW>             - Set WiFi credentials and reboot\r\n"
             "  REBOOT                       - Restart device\r\n"
