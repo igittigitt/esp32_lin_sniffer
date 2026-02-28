@@ -149,6 +149,11 @@ static struct {
 } filter_state = {0};
 
 // ── SCAN state ────────────────────────────────────────────────────
+static struct {
+    volatile bool active;
+    TaskHandle_t  task_handle;
+    int           sock;
+} scan_state = {0};
 
 // ── LOG state ─────────────────────────────────────────────────────
 typedef enum {
@@ -361,6 +366,14 @@ static void lin_scan_bus(uart_port_t uart_num, int sock)
         "══════════════════════════════════════════\r\n"
         "Scan complete.\r\n\r\n");
     broadcast_to_clients(line, pos);
+}
+
+static void scan_task(void *pvParameters)
+{
+    lin_scan_bus(UART_NUM, scan_state.sock);
+    scan_state.active      = false;
+    scan_state.task_handle = NULL;
+    vTaskDelete(NULL);
 }
 
 
@@ -850,9 +863,14 @@ void parse_command(char *cmd, int sock)
 
     // SCAN
     else if (strcmp(cmd, "SCAN") == 0) {
-        snprintf(response, sizeof(response), "# Scanning IDs 0x00-0x3F...\r\n");
-        broadcast_to_clients(response, strlen(response));
-        lin_scan_bus(UART_NUM, sock);
+        if (scan_state.active) {
+            snprintf(response, sizeof(response), "# ERROR: SCAN already running\r\n");
+            CMD_SEND(sock, response, strlen(response));
+        } else {
+            scan_state.sock   = sock;
+            scan_state.active = true;
+            xTaskCreate(scan_task, "scan", 3072, NULL, 5, &scan_state.task_handle);
+        }
     }
 
     // FORMAT <type>
