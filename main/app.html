@@ -41,7 +41,6 @@
   }
   #status.ok { background: #4caf50; }
   #version {
-    margin-left: auto;
     color: #666;
     font-size: 11px;
   }
@@ -110,7 +109,6 @@
   <h1>LIN Sniffer</h1>
   <span id="version" style="color:#666;font-size:11px"></span>
   <button id="connbtn" onclick="toggleConn()" style="background:#4caf50;font-size:11px;padding:4px 10px">Connect</button>
-  <span id="ip" style="color:#888;font-size:11px"></span>
   <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
     <input id="otafile" type="file" accept=".bin" style="display:none" />
     <button onclick='document.getElementById("otafile").click()' style="background:#5a3e8a;padding:4px 10px;font-size:11px">Flash</button>
@@ -186,7 +184,6 @@ function connect() {
     }
     status.className = 'ok';
     updBtn(true);
-    document.getElementById('ip').textContent = location.host;
     appendLine('# Connected', 'info');
   };
 
