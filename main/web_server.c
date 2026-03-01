@@ -33,8 +33,6 @@ static httpd_handle_t s_server = NULL;
 // ── Forward-Deklaration (in lin_sniffer_main.c definiert) ────────
 extern void parse_command(char *cmd, int sock);
 
-#define WS_FAKE_SOCK  (-2)
-
 // ── WebSocket Client (nur einer gleichzeitig erlaubt) ────────────
 static struct {
     int              fd;
@@ -43,21 +41,6 @@ static struct {
 
 static SemaphoreHandle_t s_ws_mutex = NULL;
 
-// ── Antwort-Puffer für parse_command() via WebSocket ─────────────
-static char   s_ws_resp_buf[1024];
-static int    s_ws_resp_len = 0;
-static int    s_ws_resp_target_fd = -1;
-
-int ws_send_shim(int fd, const void *data, size_t len)
-{
-    (void)fd;
-    size_t space = sizeof(s_ws_resp_buf) - s_ws_resp_len - 1;
-    size_t copy  = (len < space) ? len : space;
-    memcpy(s_ws_resp_buf + s_ws_resp_len, data, copy);
-    s_ws_resp_len += copy;
-    s_ws_resp_buf[s_ws_resp_len] = '\0';
-    return (int)len;
-}
 
 // ── Terminal HTML ─────────────────────────────────────────────────
 
@@ -114,7 +97,7 @@ static const char TERMINAL_HTML[] =
 "<script>"
 "const log=document.getElementById('log');"
 "const status=document.getElementById('status');"
-"let ws,autoScroll=true;"
+"let ws,autoScroll=true,cmdHistory=[],historyPos=-1,historyDraft='';"
 ""
 "function appendLine(text,cls){"
 "  const el=document.createElement('div');"
@@ -166,11 +149,27 @@ static const char TERMINAL_HTML[] =
 "  if(!v||!ws||ws.readyState!==1)return;"
 "  ws.send(v);"
 "  appendLine('> '+v,'sys');"
+"  if(!cmdHistory.length||cmdHistory[0]!==v)cmdHistory.unshift(v);"
+"  if(cmdHistory.length>50)cmdHistory.length=50;"
+"  historyPos=-1;"
+"  historyDraft='';"
 "  inp.value='';"
 "}"
 ""
 "document.getElementById('cmd').addEventListener('keydown',e=>{"
-"  if(e.key==='Enter')sendCmd();"
+"  if(e.key==='Enter'){sendCmd();return;}"
+"  if(e.key==='ArrowUp'){"
+"    e.preventDefault();"
+"    if(historyPos===-1)historyDraft=e.target.value;"
+"    if(historyPos<cmdHistory.length-1){historyPos++;e.target.value=cmdHistory[historyPos];}"
+"    return;"
+"  }"
+"  if(e.key==='ArrowDown'){"
+"    e.preventDefault();"
+"    if(historyPos>0){historyPos--;e.target.value=cmdHistory[historyPos];}"
+"    else if(historyPos===0){historyPos=-1;e.target.value=historyDraft;}"
+"    return;"
+"  }"
 "});"
 ""
 "function clearLog(){log.innerHTML='';}"
@@ -417,17 +416,6 @@ static esp_err_t handler_ws(httpd_req_t *req)
         ESP_LOGI(TAG, "WS: Client connected fd=%d", fd);
         ws_client_add(fd);
 
-        // Version beim WebSocket-Connect senden
-        char welcome[128];
-        snprintf(welcome, sizeof(welcome),
-                 "# LIN Sniffer v" LIN_SNIFFER_VERSION " (type HELP for commands)\r\n");
-        httpd_ws_frame_t pkt = {
-            .type    = HTTPD_WS_TYPE_TEXT,
-            .payload = (uint8_t *)welcome,
-            .len     = strlen(welcome),
-        };
-        httpd_ws_send_frame(req, &pkt);
-
         return ESP_OK;
     }
 
@@ -453,23 +441,9 @@ static esp_err_t handler_ws(httpd_req_t *req)
         return ret;
     }
 
-    s_ws_resp_len = 0;
-    s_ws_resp_buf[0] = '\0';
-    s_ws_resp_target_fd = fd;
-
     parse_command((char *)buf, WS_FAKE_SOCK);
 
     free(buf);
-
-    if (s_ws_resp_len > 0) {
-        httpd_ws_frame_t resp = {
-            .type    = HTTPD_WS_TYPE_TEXT,
-            .payload = (uint8_t *)s_ws_resp_buf,
-            .len     = s_ws_resp_len,
-        };
-        httpd_ws_send_frame(req, &resp);
-    }
-
     return ESP_OK;
 }
 

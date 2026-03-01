@@ -33,13 +33,6 @@
 
 static const char *TAG = "LIN_SNIFFER";
 
-// Ausgabe-Makro: bei WS_FAKE_SOCK in WS-Puffer schreiben
-#define CMD_SEND(s, buf, len)  \
-    do { \
-        if ((s) == WS_FAKE_SOCK) ws_send_shim((s), (buf), (len)); \
-        else send((s), (buf), (len), 0); \
-    } while(0)
-
 // ═══════════════════════════════════════════════════════════════════
 // Configuration
 // ═══════════════════════════════════════════════════════════════════
@@ -116,6 +109,7 @@ static struct {
     uint32_t      duration_ms;  // 0 = use count, >0 = run for N ms
     bool          wake;         // send wakeup pulse before first frame
     int           sock;         // client socket for status messages
+    volatile bool rx_done;      // response received in current cycle
 } poll_state = {0};
 
 // ── SEND-loop state ──────────────────────────────────────────────
@@ -289,8 +283,14 @@ void lin_rx_callback(uint8_t id, const uint8_t *data, uint8_t len,
                     lin_checksum_type_t checksum_type, uint64_t timestamp_us,
                     void *user_data)
 {
-    // Filter check: skip if not in allowed list
-    if (!filter_check(id)) return;
+    // During POLL: always show poll ID (bypass filter), suppress duplicates per cycle
+    if (poll_state.active && id == poll_state.id) {
+        if (poll_state.rx_done) return;
+        poll_state.rx_done = true;
+    } else {
+        // Filter check: skip if not in allowed list
+        if (!filter_check(id)) return;
+    }
 
     // During SCAN: show only the first frame per probed ID
     if (scan_state.active) {
@@ -438,36 +438,56 @@ void poll_task(void *pvParameters)
 
     if (poll_state.wake) {
         snprintf(buf, sizeof(buf), "# WAKE: sending wakeup pulse...\r\n");
-        CMD_SEND(poll_state.sock, buf, strlen(buf));
+        broadcast_to_clients(buf, strlen(buf));
         xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
         lin_send_wakeup(UART_NUM);
         xSemaphoreGive(s_lin_tx_mutex);
         vTaskDelay(pdMS_TO_TICKS(LIN_WAKEUP_WAIT_MS));
         snprintf(buf, sizeof(buf), "# WAKE: slaves ready\r\n");
-        CMD_SEND(poll_state.sock, buf, strlen(buf));
+        broadcast_to_clients(buf, strlen(buf));
     }
 
-    snprintf(buf, sizeof(buf), "POLL started: ID=0x%02X period=%lums%s\r\n",
+    snprintf(buf, sizeof(buf), "# POLL started: ID=0x%02X period=%lums%s\r\n",
              poll_state.id, poll_state.period_ms,
              (poll_state.count > 0)      ? " (count limit)" :
              (poll_state.duration_ms > 0) ? " (time limit)"  : " (endless)");
-    CMD_SEND(poll_state.sock, buf, strlen(buf));
+    broadcast_to_clients(buf, strlen(buf));
+
+    // Response window: wait this long for a slave reply before marking UNANSWERED
+    const uint32_t resp_wait_ms = LIN_BYTE_TIMEOUT_MS + 10;
 
     while (!poll_state.stop) {
         if (poll_state.count > 0 && count >= poll_state.count) break;
         if (limit_us > 0 && (esp_timer_get_time() - start_us) >= limit_us) break;
 
+        poll_state.rx_done = false;
+
         xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
         lin_send_header(UART_NUM, poll_state.id);
         xSemaphoreGive(s_lin_tx_mutex);
         led_indicator_send(LED_EVENT_LIN_TX);
+
+        // Wait for response window (lets uart_event_task + parser fire lin_rx_callback)
+        uint32_t wait1 = (resp_wait_ms < poll_state.period_ms) ? resp_wait_ms : poll_state.period_ms;
+        vTaskDelay(pdMS_TO_TICKS(wait1));
+
+        // If no RX frame seen (no TX echo or silent slave), output UNANSWERED explicitly
+        if (!poll_state.rx_done) {
+            output_frame(poll_state.id, NULL, 0, LIN_CHECKSUM_CLASSIC,
+                         esp_timer_get_time(), "RX");
+            poll_state.rx_done = true;
+        }
+
         count++;
 
-        vTaskDelay(pdMS_TO_TICKS(poll_state.period_ms));
+        // Wait remaining period
+        if (poll_state.period_ms > wait1) {
+            vTaskDelay(pdMS_TO_TICKS(poll_state.period_ms - wait1));
+        }
     }
 
-    snprintf(buf, sizeof(buf), "POLL stopped: %lu frames sent\r\n", count);
-    CMD_SEND(poll_state.sock, buf, strlen(buf));
+    snprintf(buf, sizeof(buf), "# POLL stopped: %lu frames sent\r\n", count);
+    broadcast_to_clients(buf, strlen(buf));
 
     poll_state.active      = false;
     poll_state.task_handle = NULL;
@@ -497,20 +517,20 @@ void send_loop_task(void *pvParameters)
 
     if (send_loop_state.wake) {
         snprintf(buf, sizeof(buf), "# WAKE: sending wakeup pulse...\r\n");
-        CMD_SEND(send_loop_state.sock, buf, strlen(buf));
+        broadcast_to_clients(buf, strlen(buf));
         xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
         lin_send_wakeup(UART_NUM);
         xSemaphoreGive(s_lin_tx_mutex);
         vTaskDelay(pdMS_TO_TICKS(LIN_WAKEUP_WAIT_MS));
         snprintf(buf, sizeof(buf), "# WAKE: slaves ready\r\n");
-        CMD_SEND(send_loop_state.sock, buf, strlen(buf));
+        broadcast_to_clients(buf, strlen(buf));
     }
 
     snprintf(buf, sizeof(buf), "# SEND loop started: ID=0x%02X period=%lums%s\r\n",
              send_loop_state.id, send_loop_state.period_ms,
              (send_loop_state.count > 0)       ? " (count limit)" :
              (send_loop_state.duration_ms > 0) ? " (time limit)"  : " (endless)");
-    CMD_SEND(send_loop_state.sock, buf, strlen(buf));
+    broadcast_to_clients(buf, strlen(buf));
 
     lin_frame_t frame = {
         .id            = send_loop_state.id,
@@ -536,7 +556,7 @@ void send_loop_task(void *pvParameters)
     }
 
     snprintf(buf, sizeof(buf), "# SEND loop stopped: %lu frames sent\r\n", count);
-    CMD_SEND(send_loop_state.sock, buf, strlen(buf));
+    broadcast_to_clients(buf, strlen(buf));
 
     send_loop_state.active      = false;
     send_loop_state.task_handle = NULL;
@@ -699,7 +719,7 @@ void parse_command(char *cmd, int sock)
             send_loop_state.stop        = false;
             send_loop_state.active      = true;
 
-            xTaskCreate(send_loop_task, "send_loop", 2048, NULL, 6,
+            xTaskCreate(send_loop_task, "send_loop", 4096, NULL, 6,
                         &send_loop_state.task_handle);
         }
     }
@@ -758,7 +778,7 @@ void parse_command(char *cmd, int sock)
                 poll_state.stop        = false;
                 poll_state.active      = true;
 
-                xTaskCreate(poll_task, "poll", 2048, NULL, 6, &poll_state.task_handle);
+                xTaskCreate(poll_task, "poll", 4096, NULL, 6, &poll_state.task_handle);
             }
         }
     }
