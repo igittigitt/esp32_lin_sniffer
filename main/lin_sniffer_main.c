@@ -152,6 +152,7 @@ static struct {
 static struct {
     volatile bool    active;
     volatile uint8_t current_scan_id;   // ID currently being probed
+    volatile bool    scan_id_done;      // first frame already shown for this ID
     TaskHandle_t     task_handle;
     int              sock;
 } scan_state = {0};
@@ -288,10 +289,11 @@ void lin_rx_callback(uint8_t id, const uint8_t *data, uint8_t len,
     // Filter check: skip if not in allowed list
     if (!filter_check(id)) return;
 
-    // During SCAN: only show responses for the currently probed ID
+    // During SCAN: show only the first frame per probed ID
     if (scan_state.active) {
         if (id != scan_state.current_scan_id) return;
-        if (data == NULL || len == 0) return;
+        if (scan_state.scan_id_done) return;
+        scan_state.scan_id_done = true;
     }
 
     if (data == NULL || len == 0) {
@@ -362,6 +364,7 @@ static void lin_scan_bus(uart_port_t uart_num, int sock)
     broadcast_to_clients(line, pos);
 
     for (uint8_t id = 0x00; id <= 0x3F; id++) {
+        scan_state.scan_id_done    = false;
         scan_state.current_scan_id = id;
         lin_send_header(uart_num, id);
         led_indicator_send(LED_EVENT_LIN_TX);

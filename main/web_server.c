@@ -35,13 +35,11 @@ extern void parse_command(char *cmd, int sock);
 
 #define WS_FAKE_SOCK  (-2)
 
-// ── WebSocket Client-Liste ───────────────────────────────────────
-#define WS_MAX_CLIENTS  4
-
+// ── WebSocket Client (nur einer gleichzeitig erlaubt) ────────────
 static struct {
-    int      fd;
+    int              fd;
     ringbuf_reader_t reader;
-} s_ws_clients[WS_MAX_CLIENTS];
+} s_ws_client = { .fd = -1 };
 
 static SemaphoreHandle_t s_ws_mutex = NULL;
 
@@ -390,26 +388,23 @@ static esp_err_t handler_ota(httpd_req_t *req)
 static void ws_client_add(int fd)
 {
     xSemaphoreTake(s_ws_mutex, portMAX_DELAY);
-    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-        if (s_ws_clients[i].fd == -1) {
-            s_ws_clients[i].fd = fd;
-            ringbuf_reader_init_from_history(&s_ws_clients[i].reader, CONFIG_WS_RECONNECT_HISTORY_LINES);
-            ESP_LOGI(TAG, "WS Client %d connected (slot %d)", fd, i);
-            break;
-        }
+    if (s_ws_client.fd != -1 && s_ws_client.fd != fd) {
+        ESP_LOGI(TAG, "WS: new client fd=%d, kicking old fd=%d", fd, s_ws_client.fd);
+        httpd_sess_trigger_close(s_server, s_ws_client.fd);
+        s_ws_client.fd = -1;
     }
+    s_ws_client.fd = fd;
+    ringbuf_reader_init_from_history(&s_ws_client.reader, CONFIG_WS_RECONNECT_HISTORY_LINES);
+    ESP_LOGI(TAG, "WS Client %d connected", fd);
     xSemaphoreGive(s_ws_mutex);
 }
 
 static void ws_client_remove(int fd)
 {
     xSemaphoreTake(s_ws_mutex, portMAX_DELAY);
-    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-        if (s_ws_clients[i].fd == fd) {
-            s_ws_clients[i].fd = -1;
-            ESP_LOGI(TAG, "WS Client %d disconnected (slot %d)", fd, i);
-            break;
-        }
+    if (s_ws_client.fd == fd) {
+        s_ws_client.fd = -1;
+        ESP_LOGI(TAG, "WS Client %d disconnected", fd);
     }
     xSemaphoreGive(s_ws_mutex);
 }
@@ -490,13 +485,11 @@ static void ws_push_task(void *pvParameters)
 
         xSemaphoreTake(s_ws_mutex, portMAX_DELAY);
 
-        for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-            if (s_ws_clients[i].fd == -1) continue;
-
+        if (s_ws_client.fd != -1) {
             size_t len       = 0;
             size_t batch_len = 0;
 
-            while (ringbuf_read(&s_ws_clients[i].reader, msg, &len)) {
+            while (ringbuf_read(&s_ws_client.reader, msg, &len)) {
                 if (batch_len + len > sizeof(batch)) {
                     httpd_ws_frame_t pkt = {
                         .type    = HTTPD_WS_TYPE_TEXT,
@@ -504,11 +497,11 @@ static void ws_push_task(void *pvParameters)
                         .len     = batch_len,
                     };
                     esp_err_t err = httpd_ws_send_frame_async(
-                        s_server, s_ws_clients[i].fd, &pkt);
+                        s_server, s_ws_client.fd, &pkt);
                     if (err != ESP_OK) {
                         ESP_LOGW(TAG, "WS send fd=%d failed, removing client",
-                                 s_ws_clients[i].fd);
-                        s_ws_clients[i].fd = -1;
+                                 s_ws_client.fd);
+                        s_ws_client.fd = -1;
                         batch_len = 0;
                         break;
                     }
@@ -519,18 +512,18 @@ static void ws_push_task(void *pvParameters)
                 batch_len += len;
             }
 
-            if (s_ws_clients[i].fd != -1 && batch_len > 0) {
+            if (s_ws_client.fd != -1 && batch_len > 0) {
                 httpd_ws_frame_t pkt = {
                     .type    = HTTPD_WS_TYPE_TEXT,
                     .payload = (uint8_t *)batch,
                     .len     = batch_len,
                 };
                 esp_err_t err = httpd_ws_send_frame_async(
-                    s_server, s_ws_clients[i].fd, &pkt);
+                    s_server, s_ws_client.fd, &pkt);
                 if (err != ESP_OK) {
                     ESP_LOGW(TAG, "WS send fd=%d failed, removing client",
-                             s_ws_clients[i].fd);
-                    s_ws_clients[i].fd = -1;
+                             s_ws_client.fd);
+                    s_ws_client.fd = -1;
                 } else {
                     any_sent = true;
                 }
@@ -547,14 +540,12 @@ static void ws_push_task(void *pvParameters)
 
 void web_server_start(void)
 {
-    s_ws_mutex = xSemaphoreCreateMutex();
-    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-        s_ws_clients[i].fd = -1;
-    }
+    s_ws_mutex     = xSemaphoreCreateMutex();
+    s_ws_client.fd = -1;
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = 80;
-    cfg.max_open_sockets = WS_MAX_CLIENTS + 2;
+    cfg.max_open_sockets = 4;
     cfg.lru_purge_enable = true;
     cfg.stack_size         = 8192;
     cfg.max_uri_handlers   = 8;
