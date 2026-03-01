@@ -33,33 +33,14 @@ static httpd_handle_t s_server = NULL;
 // ── Forward-Deklaration (in lin_sniffer_main.c definiert) ────────
 extern void parse_command(char *cmd, int sock);
 
-#define WS_FAKE_SOCK  (-2)
-
-// ── WebSocket Client-Liste ───────────────────────────────────────
-#define WS_MAX_CLIENTS  4
-
+// ── WebSocket Client (nur einer gleichzeitig erlaubt) ────────────
 static struct {
-    int      fd;
+    int              fd;
     ringbuf_reader_t reader;
-} s_ws_clients[WS_MAX_CLIENTS];
+} s_ws_client = { .fd = -1 };
 
 static SemaphoreHandle_t s_ws_mutex = NULL;
 
-// ── Antwort-Puffer für parse_command() via WebSocket ─────────────
-static char   s_ws_resp_buf[512];
-static int    s_ws_resp_len = 0;
-static int    s_ws_resp_target_fd = -1;
-
-int ws_send_shim(int fd, const void *data, size_t len)
-{
-    (void)fd;
-    size_t space = sizeof(s_ws_resp_buf) - s_ws_resp_len - 1;
-    size_t copy  = (len < space) ? len : space;
-    memcpy(s_ws_resp_buf + s_ws_resp_len, data, copy);
-    s_ws_resp_len += copy;
-    s_ws_resp_buf[s_ws_resp_len] = '\0';
-    return (int)len;
-}
 
 // ── Terminal HTML ─────────────────────────────────────────────────
 
@@ -70,24 +51,20 @@ static const char TERMINAL_HTML[] =
 "<title>LIN Sniffer</title>"
 "<style>"
 "*{box-sizing:border-box;margin:0;padding:0}"
-"body{background:#1a1a1a;color:#d4d4d4;font:13px/1.4 'Cascadia Code','Fira Code',monospace;display:flex;flex-direction:column;height:100vh}"
+"body{background:#1a1a1a;color:#d4d4d4;font:13px/1.4 'Cascadia Code','Fira Code',monospace;display:flex;flex-direction:column;position:fixed;top:0;left:0;right:0;bottom:0;overflow:hidden}"
 "#header{background:#252526;padding:8px 16px;display:flex;align-items:center;gap:12px;border-bottom:1px solid #333}"
 "#header h1{font-size:14px;font-weight:600;color:#fff}"
 "#status{width:8px;height:8px;border-radius:50%;background:#f44}"
 "#status.ok{background:#4caf50}"
 "#version{margin-left:auto;color:#666;font-size:11px}"
-"#log{flex:1;overflow-y:auto;padding:8px 12px;font-size:12px}"
+"#log{flex:1;overflow-y:auto;padding:8px 12px;font-size:12px;white-space:pre}"
 ".rx{color:#9cdcfe}.tx{color:#dcdcaa}.err{color:#f44747}.info{color:#6a9955}.sys{color:#c586c0}"
 "#inputbar{display:flex;gap:6px;padding:8px;background:#252526;border-top:1px solid #333}"
 "#cmd{flex:1;background:#3c3c3c;border:1px solid #555;color:#d4d4d4;padding:6px 10px;font:inherit;border-radius:3px;outline:none}"
 "#cmd:focus{border-color:#007acc}"
 "button{background:#007acc;color:#fff;border:none;padding:6px 14px;border-radius:3px;cursor:pointer;font:inherit}"
 "button:hover{background:#1a8ad4}"
-"#otabar{display:flex;gap:6px;padding:6px 8px;background:#1e1e1e;border-top:1px solid #333;align-items:center}"
-"#otabar label{color:#888;font-size:11px}"
-"#otafile{color:#888;font-size:11px}"
-"#otaprog{display:none;flex:1;height:8px;background:#333;border-radius:4px;overflow:hidden}"
-/* Pole-Animation: heller Streifen wandert von links nach rechts */
+"button:active{transform:scale(0.95);opacity:0.8}"
 "@keyframes pole{0%{background-position:0 0}100%{background-position:40px 0}}"
 "#otafill{height:100%;width:0%;background:#4caf50;transition:width .3s ease}"
 "#otafill.indeterminate{"
@@ -102,20 +79,21 @@ static const char TERMINAL_HTML[] =
 "  <h1>LIN Sniffer</h1>"
 "  <button id='connbtn' onclick='toggleConn()' style='background:#4caf50;font-size:11px;padding:4px 10px'>Connect</button>"
 "  <span id='ip' style='color:#888;font-size:11px'></span>"
-"  <span id='version'>v" LIN_SNIFFER_VERSION "</span>"
+"  <div style='margin-left:auto;display:flex;gap:6px;align-items:center'>"
+"    <input id='otafile' type='file' accept='.bin' style='display:none' />"
+"    <button onclick='document.getElementById(\"otafile\").click()' style='background:#5a3e8a;padding:4px 10px;font-size:11px'>Flash</button>"
+"    <div id='otaprog' style='display:none;width:150px;height:6px;background:#333;border-radius:3px;overflow:hidden'>"
+"      <div id='otafill' style='height:100%;width:0%;background:#4caf50;transition:width .3s ease'></div>"
+"    </div>"
+"    <span id='otastatus' style='color:#888;font-size:10px;min-width:100px'></span>"
+"  </div>"
 "</div>"
 "<div id='log'></div>"
 "<div id='inputbar'>"
-"  <input id='cmd' type='text' placeholder='Befehl (z.B. HEADER 0E, SCAN, HELP)' autocomplete='off' spellcheck='false' />"
-"  <button onclick='sendCmd()'>Senden</button>"
+"  <input id='cmd' type='text' placeholder='Command (e.g. HEADER 0E, SCAN, HELP)' autocomplete='off' spellcheck='false' autofocus />"
+"  <button onclick='sendCmd()'>Send</button>"
 "  <button onclick='clearLog()' style='background:#444'>Clear</button>"
-"</div>"
-"<div id='otabar'>"
-"  <label>OTA:</label>"
-"  <input id='otafile' type='file' accept='.bin' />"
-"  <button onclick='startOta()' style='background:#5a3e8a'>Flash</button>"
-"  <div id='otaprog'><div id='otafill'></div></div>"
-"  <span id='otastatus' style='color:#888;font-size:11px'></span>"
+"  <button onclick='copyLog()' style='background:#444'>Copy</button>"
 "</div>"
 "<script>"
 "const log=document.getElementById('log');"
@@ -151,10 +129,15 @@ static const char TERMINAL_HTML[] =
 "  const proto=location.protocol==='https:'?'wss':'ws';"
 "  ws=new WebSocket(proto+'://'+location.host+'/ws');"
 "  ws.onopen=()=>{"
+"    if(pendingReload){"
+"      pendingReload=false;"
+"      location.replace(location.href.split('?')[0]+'?t='+Date.now());"
+"      return;"
+"    }"
 "    status.className='ok';"
 "    updBtn(true);"
 "    document.getElementById('ip').textContent=location.host;"
-"    appendLine('# Verbunden','info');"
+"    appendLine('# Connected','info');"
 "  };"
 "  ws.onmessage=e=>{"
 "    e.data.split('\\n').forEach(l=>{if(l.trim())appendLine(l,classForLine(l));});"
@@ -184,23 +167,64 @@ static const char TERMINAL_HTML[] =
 "  if(!v||!ws||ws.readyState!==1)return;"
 "  ws.send(v);"
 "  appendLine('> '+v,'sys');"
+"  if(!cmdHistory.length||cmdHistory[0]!==v)cmdHistory.unshift(v);"
+"  if(cmdHistory.length>50)cmdHistory.length=50;"
+"  historyPos=-1;"
+"  historyDraft='';"
 "  inp.value='';"
 "}"
 ""
 "document.getElementById('cmd').addEventListener('keydown',e=>{"
-"  if(e.key==='Enter')sendCmd();"
+"  if(e.key==='Enter'){sendCmd();return;}"
+"  if(e.key==='ArrowUp'){"
+"    e.preventDefault();"
+"    if(historyPos===-1)historyDraft=e.target.value;"
+"    if(historyPos<cmdHistory.length-1){historyPos++;e.target.value=cmdHistory[historyPos];}"
+"    return;"
+"  }"
+"  if(e.key==='ArrowDown'){"
+"    e.preventDefault();"
+"    if(historyPos>0){historyPos--;e.target.value=cmdHistory[historyPos];}"
+"    else if(historyPos===0){historyPos=-1;e.target.value=historyDraft;}"
+"    return;"
+"  }"
 "});"
 ""
 "function clearLog(){log.innerHTML='';}"
+""
+"function copyLog(){"
+"  const lines=Array.from(log.children).map(el=>el.textContent).join('\\n');"
+"  if(navigator.clipboard&&navigator.clipboard.writeText){"
+"    navigator.clipboard.writeText(lines).then(()=>{"
+"      appendLine('# All output copied to clipboard','info');"
+"    }).catch(err=>{"
+"      appendLine('# Copy failed: '+err,'err');"
+"    });"
+"  }else{"
+"    const ta=document.createElement('textarea');"
+"    ta.value=lines;"
+"    ta.style.position='fixed';ta.style.opacity='0';"
+"    document.body.appendChild(ta);"
+"    ta.select();"
+"    try{"
+"      document.execCommand('copy');"
+"      appendLine('# All output copied to clipboard','info');"
+"    }catch(err){"
+"      appendLine('# Copy failed: '+err,'err');"
+"    }"
+"    document.body.removeChild(ta);"
+"  }"
+"}"
 ""
 "log.addEventListener('scroll',()=>{"
 "  autoScroll=log.scrollTop+log.clientHeight>=log.scrollHeight-20;"
 "});"
 ""
-/* OTA mit XHR für echten Upload-Fortschritt */
+"document.getElementById('otafile').addEventListener('change',startOta);"
+""
 "function startOta(){"
 "  const f=document.getElementById('otafile').files[0];"
-"  if(!f){alert('Bitte .bin-Datei wählen');return;}"
+"  if(!f){alert('Please select .bin file');return;}"
 "  const prog=document.getElementById('otaprog');"
 "  const fill=document.getElementById('otafill');"
 "  const st=document.getElementById('otastatus');"
@@ -212,7 +236,6 @@ static const char TERMINAL_HTML[] =
 ""
 "  const xhr=new XMLHttpRequest();"
 ""
-/* Upload-Fortschritt: Browser weiß wieviel er gesendet hat */
 "  xhr.upload.onprogress=function(e){"
 "    if(e.lengthComputable){"
 "      const pct=Math.round(e.loaded/e.total*100);"
@@ -221,31 +244,29 @@ static const char TERMINAL_HTML[] =
 "    }"
 "  };"
 ""
-/* Upload fertig → ESP32 flasht jetzt → Pole-Animation */
 "  xhr.upload.onload=function(){"
 "    fill.classList.add('indeterminate');"
 "    st.textContent='Flashing...';"
-"    appendLine('# OTA: Upload abgeschlossen, flashe...','info');"
+"    appendLine('# OTA: Upload complete, flashing...','info');"
 "  };"
 ""
 "  xhr.onload=function(){"
 "    fill.classList.remove('indeterminate');"
 "    fill.style.width='100%';"
 "    if(xhr.status===200){"
-"      st.textContent='OK — Neustart...';"
-"      appendLine('# OTA erfolgreich — warte auf Neustart...','info');"
-/* Nach Reboot: Seite neu laden sobald Server wieder antwortet */
+"      st.textContent='OK - Rebooting...';"
+"      appendLine('# OTA successful - waiting for reboot...','info');"
 "      waitForReboot();"
 "    }else{"
-"      st.textContent='Fehler: '+xhr.status;"
-"      appendLine('# OTA Fehler: '+xhr.status,'err');"
+"      st.textContent='Error: '+xhr.status;"
+"      appendLine('# OTA Error: '+xhr.status,'err');"
 "    }"
 "  };"
 ""
 "  xhr.onerror=function(){"
 "    fill.classList.remove('indeterminate');"
-"    st.textContent='Upload-Fehler';"
-"    appendLine('# OTA Upload-Fehler','err');"
+"    st.textContent='Upload failed';"
+"    appendLine('# OTA Upload failed','err');"
 "  };"
 ""
 "  xhr.open('POST','/ota');"
@@ -253,25 +274,22 @@ static const char TERMINAL_HTML[] =
 "  xhr.send(f);"
 "}"
 ""
-/* Polling bis ESP32 nach Reboot wieder antwortet, dann reload */
 "function waitForReboot(){"
+"  pendingReload=true;"
 "  const st=document.getElementById('otastatus');"
 "  let attempts=0;"
-"  const max=30;"  /* max 30s warten */
-"  const timer=setInterval(async()=>{"
+"  const max=60;"
+"  const timer=setInterval(()=>{"
 "    attempts++;"
-"    st.textContent='Warte auf Neustart... ('+attempts+'s)';"
-"    try{"
-"      const r=await fetch('/',{method:'HEAD',cache:'no-store'});"
-"      if(r.ok){"
-"        clearInterval(timer);"
-"        appendLine('# Gerät neu gestartet — lade Seite...','info');"
-"        setTimeout(()=>location.reload(),500);"
-"      }"
-"    }catch(e){ /* noch nicht erreichbar, weiter warten */ }"
+"    st.textContent='Waiting for reboot... ('+attempts+'s)';"
+"    if(!pendingReload){"
+"      clearInterval(timer);"
+"      st.textContent='';"
+"    }"
 "    if(attempts>=max){"
 "      clearInterval(timer);"
-"      st.textContent='Timeout — bitte manuell neu laden';"
+"      pendingReload=false;"
+"      st.textContent='Timeout - please reload manually';"
 "    }"
 "  },1000);"
 "}"
@@ -306,7 +324,7 @@ static esp_err_t handler_ota(httpd_req_t *req)
         esp_ota_get_next_update_partition(NULL);
 
     if (!update_part) {
-        ESP_LOGE(TAG, "Keine OTA-Partition gefunden!");
+        ESP_LOGE(TAG, "No OTA partition found!");
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                             "No OTA partition");
         return ESP_FAIL;
@@ -339,7 +357,7 @@ static esp_err_t handler_ota(httpd_req_t *req)
 
         if (received <= 0) {
             if (received == HTTPD_SOCK_ERR_TIMEOUT) continue;
-            ESP_LOGE(TAG, "Empfangsfehler: %d", received);
+            ESP_LOGE(TAG, "Receive error: %d", received);
             free(buf);
             esp_ota_abort(ota_handle);
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
@@ -380,7 +398,7 @@ static esp_err_t handler_ota(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "OTA erfolgreich (%d bytes) — Reboot...", total);
+    ESP_LOGI(TAG, "OTA successful (%d bytes) — Reboot...", total);
     httpd_resp_sendstr(req, "OK");
 
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -394,26 +412,23 @@ static esp_err_t handler_ota(httpd_req_t *req)
 static void ws_client_add(int fd)
 {
     xSemaphoreTake(s_ws_mutex, portMAX_DELAY);
-    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-        if (s_ws_clients[i].fd == -1) {
-            s_ws_clients[i].fd = fd;
-            ringbuf_reader_init_from_history(&s_ws_clients[i].reader, 50);
-            ESP_LOGI(TAG, "WS Client %d verbunden (slot %d)", fd, i);
-            break;
-        }
+    if (s_ws_client.fd != -1 && s_ws_client.fd != fd) {
+        ESP_LOGI(TAG, "WS: new client fd=%d, kicking old fd=%d", fd, s_ws_client.fd);
+        httpd_sess_trigger_close(s_server, s_ws_client.fd);
+        s_ws_client.fd = -1;
     }
+    s_ws_client.fd = fd;
+    ringbuf_reader_init_from_history(&s_ws_client.reader, CONFIG_WS_RECONNECT_HISTORY_LINES);
+    ESP_LOGI(TAG, "WS Client %d connected", fd);
     xSemaphoreGive(s_ws_mutex);
 }
 
 static void ws_client_remove(int fd)
 {
     xSemaphoreTake(s_ws_mutex, portMAX_DELAY);
-    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-        if (s_ws_clients[i].fd == fd) {
-            s_ws_clients[i].fd = -1;
-            ESP_LOGI(TAG, "WS Client %d getrennt (slot %d)", fd, i);
-            break;
-        }
+    if (s_ws_client.fd == fd) {
+        s_ws_client.fd = -1;
+        ESP_LOGI(TAG, "WS Client %d disconnected", fd);
     }
     xSemaphoreGive(s_ws_mutex);
 }
@@ -423,26 +438,8 @@ static esp_err_t handler_ws(httpd_req_t *req)
     int fd = httpd_req_to_sockfd(req);
 
     if (req->method == HTTP_GET) {
-        ESP_LOGI(TAG, "WS: Client verbunden fd=%d", fd);
+        ESP_LOGI(TAG, "WS: Client connected fd=%d", fd);
         ws_client_add(fd);
-
-        // Version + HELP beim WebSocket-Connect senden
-        char welcome[64];
-        snprintf(welcome, sizeof(welcome),
-                 "# LIN Sniffer v" LIN_SNIFFER_VERSION "\r\n");
-        s_ws_resp_len = 0;
-        s_ws_resp_buf[0] = '\0';
-        ws_send_shim(WS_FAKE_SOCK, welcome, strlen(welcome));
-        parse_command("HELP", WS_FAKE_SOCK);
-
-        if (s_ws_resp_len > 0) {
-            httpd_ws_frame_t pkt = {
-                .type    = HTTPD_WS_TYPE_TEXT,
-                .payload = (uint8_t *)s_ws_resp_buf,
-                .len     = s_ws_resp_len,
-            };
-            httpd_ws_send_frame(req, &pkt);
-        }
 
         return ESP_OK;
     }
@@ -469,23 +466,9 @@ static esp_err_t handler_ws(httpd_req_t *req)
         return ret;
     }
 
-    s_ws_resp_len = 0;
-    s_ws_resp_buf[0] = '\0';
-    s_ws_resp_target_fd = fd;
-
     parse_command((char *)buf, WS_FAKE_SOCK);
 
     free(buf);
-
-    if (s_ws_resp_len > 0) {
-        httpd_ws_frame_t resp = {
-            .type    = HTTPD_WS_TYPE_TEXT,
-            .payload = (uint8_t *)s_ws_resp_buf,
-            .len     = s_ws_resp_len,
-        };
-        httpd_ws_send_frame(req, &resp);
-    }
-
     return ESP_OK;
 }
 
@@ -493,6 +476,7 @@ static esp_err_t handler_ws(httpd_req_t *req)
 
 static void ws_push_task(void *pvParameters)
 {
+    static char batch[4096];
     char msg[RINGBUF_ENTRY_SIZE];
 
     while (1) {
@@ -500,26 +484,48 @@ static void ws_push_task(void *pvParameters)
 
         xSemaphoreTake(s_ws_mutex, portMAX_DELAY);
 
-        for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-            if (s_ws_clients[i].fd == -1) continue;
+        if (s_ws_client.fd != -1) {
+            size_t len       = 0;
+            size_t batch_len = 0;
 
-            size_t len = 0;
-            while (ringbuf_read(&s_ws_clients[i].reader, msg, &len)) {
+            while (ringbuf_read(&s_ws_client.reader, msg, &len)) {
+                if (batch_len + len > sizeof(batch)) {
+                    httpd_ws_frame_t pkt = {
+                        .type    = HTTPD_WS_TYPE_TEXT,
+                        .payload = (uint8_t *)batch,
+                        .len     = batch_len,
+                    };
+                    esp_err_t err = httpd_ws_send_frame_async(
+                        s_server, s_ws_client.fd, &pkt);
+                    if (err != ESP_OK) {
+                        ESP_LOGW(TAG, "WS send fd=%d failed, removing client",
+                                 s_ws_client.fd);
+                        s_ws_client.fd = -1;
+                        batch_len = 0;
+                        break;
+                    }
+                    any_sent  = true;
+                    batch_len = 0;
+                }
+                memcpy(batch + batch_len, msg, len);
+                batch_len += len;
+            }
+
+            if (s_ws_client.fd != -1 && batch_len > 0) {
                 httpd_ws_frame_t pkt = {
                     .type    = HTTPD_WS_TYPE_TEXT,
-                    .payload = (uint8_t *)msg,
-                    .len     = len,
+                    .payload = (uint8_t *)batch,
+                    .len     = batch_len,
                 };
                 esp_err_t err = httpd_ws_send_frame_async(
-                    s_server, s_ws_clients[i].fd, &pkt);
-
+                    s_server, s_ws_client.fd, &pkt);
                 if (err != ESP_OK) {
-                    ESP_LOGW(TAG, "WS send fd=%d fehlgeschlagen, entferne Client",
-                             s_ws_clients[i].fd);
-                    s_ws_clients[i].fd = -1;
-                    break;
+                    ESP_LOGW(TAG, "WS send fd=%d failed, removing client",
+                             s_ws_client.fd);
+                    s_ws_client.fd = -1;
+                } else {
+                    any_sent = true;
                 }
-                any_sent = true;
             }
         }
 
@@ -533,14 +539,12 @@ static void ws_push_task(void *pvParameters)
 
 void web_server_start(void)
 {
-    s_ws_mutex = xSemaphoreCreateMutex();
-    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-        s_ws_clients[i].fd = -1;
-    }
+    s_ws_mutex     = xSemaphoreCreateMutex();
+    s_ws_client.fd = -1;
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = 80;
-    cfg.max_open_sockets = WS_MAX_CLIENTS + 2;
+    cfg.max_open_sockets = 4;
     cfg.lru_purge_enable = true;
     cfg.stack_size         = 8192;
     cfg.max_uri_handlers   = 8;
@@ -548,7 +552,7 @@ void web_server_start(void)
     cfg.send_wait_timeout  = 10;
 
     if (httpd_start(&s_server, &cfg) != ESP_OK) {
-        ESP_LOGE(TAG, "httpd_start fehlgeschlagen");
+        ESP_LOGE(TAG, "httpd_start failed");
         return;
     }
 
@@ -577,7 +581,7 @@ void web_server_start(void)
 
     xTaskCreate(ws_push_task, "ws_push", 4096, NULL, 4, NULL);
 
-    ESP_LOGI(TAG, "Webserver v" LIN_SNIFFER_VERSION " gestartet auf Port 80");
+    ESP_LOGI(TAG, "Webserver v" LIN_SNIFFER_VERSION " started on port 80");
 }
 
 void web_server_stop(void)

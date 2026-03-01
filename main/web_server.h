@@ -17,13 +17,11 @@ extern "C" {
 
 #define WS_FAKE_SOCK  (-2)
 
-// Shim-Funktion (in web_server.c implementiert)
-int ws_send_shim(int fd, const void *data, size_t len);
-
 // Makro für alle send()-Aufrufe in parse_command()
+// WS-Antworten gehen über broadcast_to_clients() → Ring Buffer → ws_push_task
 #define CMD_SEND(s, buf, len) \
     do { \
-        if ((s) == WS_FAKE_SOCK) ws_send_shim((s), (buf), (len)); \
+        if ((s) == WS_FAKE_SOCK) broadcast_to_clients((buf), (int)(len)); \
         else send((s), (buf), (len), 0); \
     } while(0)
 

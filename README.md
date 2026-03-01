@@ -80,22 +80,15 @@ Configurable options are:
 #define LIN_BAUDRATE    LIN_BAUDRATE_9600  // or LIN_BAUDRATE_19200
 ```
 
-# Command Reference
+# LINBUS Analyzer Tool
 
-Connect via Telnet on port 23 (default) using any terminal-program (e.g. PuTTY), or open any Web-Browser at http://<IP-OF-SNIFFER> and use the command-inputfield to issue one of the following commands:
+In tools/ subdir you find a analyzing tool, written as pure Web-App so you can open it in any browser you like. It can read CANDUMP logfiles and offer several filter and statistic functions.
 
-- HEADER <ID>
-- SEND <ID> <data>
-- POLL <ID> <ms> [<count>|<N>s]
-- SLAVE <ID> <data>
-- STOP
-- SCAN
-- WIFI <SSID> <PW>
-- STATUS
-- REBOOT
-- HELP
+# Commands
 
-## Commands
+Connect via Telnet on port 23 (default) using any terminal-program (e.g. PuTTY), or open any Web-Browser at http://<IP-OF-SNIFFER> and use the command-inputfield to issue one of the following commands.
+
+## Command Reference
 
 ### `HEADER <ID>`
 Sends a LIN header (BREAK + SYNC + PID) for the given frame ID and listens for a slave response. The response is printed in candump format.
@@ -146,12 +139,69 @@ POLL 0D 200 10s
 
 ---
 
+### `FILTER <ID> [<ID> ...]`
+Filters candump output to show only the specified frame IDs. Multiple IDs can be specified separated by spaces. Use `STOP` to deactivate.
+
+```
+FILTER 05 0D 25
+→ FILTER active: 3 ID(s)
+→ (1.500000) lin0 005#A1B2 # RX Classic
+→ (1.600000) lin0 00D#C3D4 # RX Enhanced
+→ (1.700000) lin0 025#E5F6 # RX Classic
+
+FILTER 05
+→ FILTER active: 1 ID(s)
+```
+
+---
+
+### `LOG CANDUMP | LOG HUMAN`
+Starts logging LIN bus traffic in the specified format. By default, **no logging is active** — frames are received but not output until you start logging.
+
+**CANDUMP format** — compatible with standard Linux candump tools:
+```
+LOG CANDUMP
+→ LOG started: CANDUMP format
+→ (1.500000) lin0 005#400B # RX Classic
+→ (1.600000) lin0 00D#CF1FC244 # RX Classic
+→ (1.700000) lin0 000# # UNANSWERED
+```
+
+**HUMAN format** — human-readable table:
+```
+LOG HUMAN
+→ LOG started: HUMAN format
+→ 05 | 40 0B                            CLA | @.       |
+→ 0D | CF 1F C2 44                      CLA | ....     |
+→ 00 | UNANSWERED                       --- | -------- |
+→ 2B | 03 31 30 43 36 37 39 00          CLA | .10C6790 |
+```
+
+Format columns:
+- **ID**: LIN frame ID (00-3F)
+- **Data Bytes**: Up to 8 data bytes in hex (24 chars wide)
+- **CRC**: `CLA` (Classic) or `ENH` (Enhanced), `---` for unanswered
+- **ASCII**: Printable characters or `.` for non-printable
+
+Use `STOP` to stop logging.
+
+---
+
 ### `STOP`
-Stops a running `POLL` immediately.
+Stops a running `POLL`, `SLAVE` simulation, or `FILTER` (or any combination if multiple are active).
 
 ```
 STOP
 → POLL stopped
+
+STOP
+→ SLAVE stopped
+
+STOP
+→ POLL and SLAVE and FILTER stopped
+
+STOP
+→ Nothing running
 ```
 
 ---
@@ -235,18 +285,50 @@ SLAVE 05 FF 00 00 00
 
 ---
 
+### `LOG CANDUMP | LOG HUMAN`
+Starts logging LIN bus traffic in the specified format. By default, **no logging is active** — frames are received but not output until you start logging.
+
+**CANDUMP format** — compatible with standard Linux candump tools:
+```
+LOG CANDUMP
+→ LOG started: CANDUMP format
+→ (1.500000) lin0 005#400B # RX Classic
+→ (1.600000) lin0 00D#CF1FC244 # RX Classic
+→ (1.700000) lin0 000# # UNANSWERED
+```
+
+**HUMAN format** — human-readable table:
+```
+LOG HUMAN
+→ LOG started: HUMAN format
+→ 05 | 40 0B                            CLA | @.       |
+→ 0D | CF 1F C2 44                      CLA | ....     |
+→ 00 | UNANSWERED                       --- | -------- |
+→ 2B | 03 31 30 43 36 37 39 00          CLA | .10C6790 |
+```
+
+Format columns:
+- **ID**: LIN frame ID (00-3F)
+- **Data Bytes**: Up to 8 data bytes in hex (24 chars wide)
+- **CRC**: `CLA` (Classic) or `ENH` (Enhanced), `---` for unanswered
+- **ASCII**: Printable characters or `.` for non-printable
+
+Use `STOP` to stop logging.
+
+---
+
 ### `STOP`
-Stops a running `POLL` or `SLAVE` simulation (or both if both are active).
+Stops a running `POLL`, `SLAVE` simulation, or `FILTER` (or any combination if multiple are active).
 
 ```
-STOP
-→ SLAVE sim stopped
-
 STOP
 → POLL stopped
 
 STOP
-→ POLL and SLAVE stopped
+→ SLAVE stopped
+
+STOP
+→ POLL and SLAVE and FILTER stopped
 
 STOP
 → Nothing running
@@ -272,6 +354,8 @@ HELP
 - Unanswered frames are shown as: `(timestamp) lin0 ID# # UNANSWERED`
 - Slave simulation output is labeled `SIM`: `(timestamp) lin0 ID#DATA # SIM Enhanced`
 - Telnet IAC negotiation bytes are filtered automatically.
+
+---
 
 # Licence
 

@@ -1,3 +1,4 @@
 #pragma once
 
-#define LIN_SNIFFER_VERSION  "1.2.0"
+#define LIN_SNIFFER_VERSION  "1.8.5"
+#define LIN_BUS_NAMES        "LIN0"

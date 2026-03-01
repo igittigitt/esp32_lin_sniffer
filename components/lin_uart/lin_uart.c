@@ -188,6 +188,17 @@ esp_err_t lin_send_frame(uart_port_t uart_num, const lin_frame_t *frame)
     return ESP_OK;
 }
 
+void lin_send_wakeup(uart_port_t uart_num)
+{
+    uart_wait_tx_done(uart_num, pdMS_TO_TICKS(10));
+    gpio_set_direction(lin_tx_gpio, GPIO_MODE_OUTPUT);
+    gpio_set_level(lin_tx_gpio, 0);                    // dominant pulse
+    delay_us(LIN_WAKEUP_PULSE_US);
+    gpio_set_level(lin_tx_gpio, 1);                    // release to recessive
+    uart_set_pin(uart_num, lin_tx_gpio, UART_PIN_NO_CHANGE,
+                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+}
+
 esp_err_t lin_send_header(uart_port_t uart_num, uint8_t id)
 {
     if (id > 0x3F) return ESP_ERR_INVALID_ARG;

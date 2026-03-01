@@ -33,13 +33,6 @@
 
 static const char *TAG = "LIN_SNIFFER";
 
-// Ausgabe-Makro: bei WS_FAKE_SOCK in WS-Puffer schreiben
-#define CMD_SEND(s, buf, len)  \
-    do { \
-        if ((s) == WS_FAKE_SOCK) ws_send_shim((s), (buf), (len)); \
-        else send((s), (buf), (len), 0); \
-    } while(0)
-
 // ═══════════════════════════════════════════════════════════════════
 // Configuration
 // ═══════════════════════════════════════════════════════════════════
@@ -100,14 +93,6 @@ static const char *TAG = "LIN_SNIFFER";
 // Global Variables
 // ═══════════════════════════════════════════════════════════════════
 
-static struct {
-    uint32_t total_frames;
-    uint32_t valid_frames;
-    uint32_t unanswered_frames;
-    uint32_t tx_frames;
-    uint32_t errors;
-} stats = {0};
-
 static uint64_t boot_timestamp_us = 0;
 static QueueHandle_t uart_queue;
 static int client_sockets[MAX_CLIENTS];
@@ -122,8 +107,25 @@ static struct {
     uint32_t      period_ms;    // interval between headers
     uint32_t      count;        // 0 = endless, >0 = N times
     uint32_t      duration_ms;  // 0 = use count, >0 = run for N ms
+    bool          wake;         // send wakeup pulse before first frame
     int           sock;         // client socket for status messages
+    volatile bool rx_done;      // response received in current cycle
 } poll_state = {0};
+
+// ── SEND-loop state ──────────────────────────────────────────────
+static struct {
+    volatile bool active;
+    volatile bool stop;
+    TaskHandle_t  task_handle;
+    uint8_t       id;
+    uint8_t       data[LIN_MAX_DATA_LEN];
+    uint8_t       data_len;
+    uint32_t      period_ms;
+    uint32_t      count;        // 0 = endless, >0 = N times
+    uint32_t      duration_ms;  // 0 = use count, >0 = run for N ms
+    bool          wake;         // send wakeup pulse before first frame
+    int           sock;
+} send_loop_state = {0};
 
 // ── SLAVE simulation state ────────────────────────────────────────
 static struct {
@@ -133,12 +135,39 @@ static struct {
     uint8_t       data_len;
 } slave_state = {0};
 
+// ── FILTER state ──────────────────────────────────────────────────
+static struct {
+    volatile bool active;           // filter active
+    uint8_t       ids[64];          // allowed IDs (max 64 = 0x00-0x3F)
+    uint8_t       count;            // number of IDs in filter
+} filter_state = {0};
+
+// ── SCAN state ────────────────────────────────────────────────────
+static struct {
+    volatile bool    active;
+    volatile uint8_t current_scan_id;   // ID currently being probed
+    volatile bool    scan_id_done;      // first frame already shown for this ID
+    TaskHandle_t     task_handle;
+    int              sock;
+} scan_state = {0};
+
+// ── LIN TX Mutex (serializes concurrent UART TX from multiple tasks) ──
+static SemaphoreHandle_t s_lin_tx_mutex = NULL;
+
+// ── LOG state ─────────────────────────────────────────────────────
+typedef enum {
+    LOG_FORMAT_CANDUMP,
+    LOG_FORMAT_HUMAN
+} log_format_t;
+
+static log_format_t current_format = LOG_FORMAT_HUMAN;  // Default format
+
 // ═══════════════════════════════════════════════════════════════════
 // Prototypes
 // ═══════════════════════════════════════════════════════════════════
 
 void    broadcast_to_clients(const char *message, int len);
-void    output_candump(uint8_t id, const uint8_t *data, uint8_t len,
+void    output_frame(uint8_t id, const uint8_t *data, uint8_t len,
                        lin_checksum_type_t checksum_type, uint64_t timestamp_us,
                        const char *label);
 void    lin_rx_callback(uint8_t id, const uint8_t *data, uint8_t len,
@@ -151,18 +180,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 void    wifi_start_ap(void);
 void    wifi_connect_sta(const char *ssid, const char *password);
 void    wifi_init(void);
-static bool scan_request(uart_port_t uart_num, uint8_t id, uint8_t *buf, uint8_t *out_len);
-static void lin_scan_bus(uart_port_t uart_num, int sock);
-void    parse_command(char *cmd, int sock);
-void    uart_event_task(void *pvParameters);
-void    client_handler_task(void *pvParameters);
-void    tcp_server_task(void *pvParameters);
-void    statistics_task(void *pvParameters);
-void    poll_task(void *pvParameters);
-static void slave_sim_respond(uint8_t id);
+
 
 // ═══════════════════════════════════════════════════════════════════
-// Helper Functions
+// Ring Buffer for broadcasting to all clients
 // ═══════════════════════════════════════════════════════════════════
 
 void broadcast_to_clients(const char *message, int len)
@@ -171,47 +192,119 @@ void broadcast_to_clients(const char *message, int len)
     ringbuf_push(message);
 }
 
-void output_candump(uint8_t id, const uint8_t *data, uint8_t len,
-                   lin_checksum_type_t checksum_type, uint64_t timestamp_us,
-                   const char *label)
+// Format a frame according to current_format, write to buffer
+static int format_frame(char *buf, size_t buf_size, uint8_t id, 
+                       const uint8_t *data, uint8_t len,
+                       lin_checksum_type_t checksum_type, 
+                       uint64_t timestamp_us, const char *label)
 {
-    char buf[128];
     int pos = 0;
 
-    double timestamp_sec = (timestamp_us - boot_timestamp_us) / 1000000.0;
-    pos = snprintf(buf, sizeof(buf), "(%.6f) lin0 %03X#", timestamp_sec, id);
+    if (current_format == LOG_FORMAT_CANDUMP) {
+        // candump format
+        double timestamp_sec = (timestamp_us - boot_timestamp_us) / 1000000.0;
+        pos = snprintf(buf, buf_size, "(%.6f) lin0 %03X#", timestamp_sec, id);
 
-    for (int i = 0; i < len; i++) {
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "%02X", data[i]);
+        if (data && len > 0) {
+            for (int i = 0; i < len; i++) {
+                pos += snprintf(buf + pos, buf_size - pos, "%02X", data[i]);
+            }
+            const char *chk_type = (checksum_type == LIN_CHECKSUM_CLASSIC) ? "Classic" : "Enhanced";
+            pos += snprintf(buf + pos, buf_size - pos, " # %s %s", label, chk_type);
+        } else {
+            pos += snprintf(buf + pos, buf_size - pos, " # UNANSWERED");
+        }
+        pos += snprintf(buf + pos, buf_size - pos, "\r\n");
+        
+    } else {  // LOG_FORMAT_HUMAN
+        // Human format: Timestamp | ID | Data Bytes                      CRC | ASCII    |
+        double timestamp_sec = (timestamp_us - boot_timestamp_us) / 1000000.0;
+        char data_str[32];
+        char crc_str[4];
+        char ascii_str[9];
+        
+        if (data && len > 0) {
+            // Build data bytes string (no padding needed)
+            int dpos = 0;
+            for (int i = 0; i < len && i < 8; i++) {
+                dpos += snprintf(data_str + dpos, sizeof(data_str) - dpos, "%02X ", data[i]);
+            }
+            data_str[dpos] = '\0';
+            
+            snprintf(crc_str, sizeof(crc_str), "%s", 
+                     (checksum_type == LIN_CHECKSUM_CLASSIC) ? "CLA" : "ENH");
+            
+            // Build ASCII string
+            for (int i = 0; i < len && i < 8; i++) {
+                ascii_str[i] = (data[i] >= 0x20 && data[i] < 0x7F) ? data[i] : '.';
+            }
+            ascii_str[len < 8 ? len : 8] = '\0';
+        } else {
+            // UNANSWERED
+            strcpy(data_str, "UNANSWERED");
+            strcpy(crc_str, "---");
+            ascii_str[0] = '\0';
+        }
+        
+        // Fixed-width columns via format string
+        pos = snprintf(buf, buf_size, "%10.3f | %02X | %-24s | %-3s | %-8s |\r\n",
+                      timestamp_sec, id, data_str, crc_str, ascii_str);
     }
+    
+    return pos;
+}
 
-    const char *chk_type = (checksum_type == LIN_CHECKSUM_CLASSIC) ? "Classic" : "Enhanced";
-    pos += snprintf(buf + pos, sizeof(buf) - pos, " # %s %s\r\n", label, chk_type);
-
+void output_frame(uint8_t id, const uint8_t *data, uint8_t len,
+                 lin_checksum_type_t checksum_type, uint64_t timestamp_us,
+                 const char *label)
+{
+    char buf[128];
+    int pos = format_frame(buf, sizeof(buf), id, data, len, checksum_type, timestamp_us, label);
     broadcast_to_clients(buf, pos);
 }
+
+
 
 // ═══════════════════════════════════════════════════════════════════
 // LIN RX Callback
 // ═══════════════════════════════════════════════════════════════════
 
+// Returns true if ID should be shown (no filter active OR ID is in list)
+static bool filter_check(uint8_t id)
+{
+    if (!filter_state.active) return true;
+    for (int i = 0; i < filter_state.count; i++) {
+        if (filter_state.ids[i] == id) return true;
+    }
+    return false;
+}
+
 void lin_rx_callback(uint8_t id, const uint8_t *data, uint8_t len,
                     lin_checksum_type_t checksum_type, uint64_t timestamp_us,
                     void *user_data)
 {
-    stats.total_frames++;
+    // During POLL: always show poll ID (bypass filter), suppress duplicates per cycle
+    if (poll_state.active && id == poll_state.id) {
+        if (poll_state.rx_done) return;
+        poll_state.rx_done = true;
+    } else {
+        // Filter check: skip if not in allowed list
+        if (!filter_check(id)) return;
+    }
+
+    // During SCAN: show only the first frame per probed ID
+    if (scan_state.active) {
+        if (id != scan_state.current_scan_id) return;
+        if (scan_state.scan_id_done) return;
+        scan_state.scan_id_done = true;
+    }
 
     if (data == NULL || len == 0) {
-        stats.unanswered_frames++;
-        char buf[64];
-        double timestamp_sec = (timestamp_us - boot_timestamp_us) / 1000000.0;
-        int pos = snprintf(buf, sizeof(buf), "(%.6f) lin0 %03X# # UNANSWERED\r\n",
-                          timestamp_sec, id);
-        broadcast_to_clients(buf, pos);
+        // UNANSWERED frames - use output_frame to respect log format
+        output_frame(id, NULL, 0, checksum_type, timestamp_us, "RX");
     } else {
-        stats.valid_frames++;
         led_indicator_send(LED_EVENT_LIN_RX);
-        output_candump(id, data, len, checksum_type, timestamp_us, "RX");
+        output_frame(id, data, len, checksum_type, timestamp_us, "RX");
         ESP_LOGD(TAG, "RX: ID 0x%02X, len %d", id, len);
     }
 }
@@ -259,123 +352,49 @@ bool wifi_set_credentials(const char *ssid, const char *password)
 // ═══════════════════════════════════════════════════════════════════
 // LIN Scanner
 // ═══════════════════════════════════════════════════════════════════
-
-static bool scan_request(uart_port_t uart_num, uint8_t id,
-                         uint8_t *buf, uint8_t *out_len)
-{
-    uart_flush_input(uart_num);
-    lin_send_header(uart_num, id);
-    stats.tx_frames++;
-    led_indicator_send(LED_EVENT_LIN_TX);
-
-    vTaskDelay(pdMS_TO_TICKS(SCAN_RESPONSE_MS));
-
-    int len = uart_read_bytes(uart_num, buf, LIN_MAX_DATA_LEN + 1, pdMS_TO_TICKS(5));
-    if (len > 1) {
-        *out_len = len - 1;
-        return true;
-    }
-    *out_len = 0;
-    return false;
-}
+// LIN Scanner
+// ═══════════════════════════════════════════════════════════════════
 
 static void lin_scan_bus(uart_port_t uart_num, int sock)
 {
     char line[256];
     int  pos;
-    int  found = 0;
 
     pos = snprintf(line, sizeof(line), "\r\n+++ LIN Bus Scan  (0x00 - 0x3F) +++\r\n");
-    CMD_SEND(sock, line, pos);
+    broadcast_to_clients(line, pos);
+    
+    pos = snprintf(line, sizeof(line), "Scanning IDs 0x00-0x3F...\r\n");
+    broadcast_to_clients(line, pos);
 
     for (uint8_t id = 0x00; id <= 0x3F; id++) {
-        uint8_t buf[LIN_MAX_DATA_LEN + 1];
-        uint8_t buf_len = 0;
-
-        if (!scan_request(uart_num, id, buf, &buf_len)) {
-            vTaskDelay(pdMS_TO_TICKS(SCAN_INTER_FRAME_MS));
-            continue;
-        }
-
-        found++;
-
-        bool is_multiframe = (buf_len == 8 && buf[0] >= 0x01 && buf[0] <= 0x0F);
-
-        if (!is_multiframe) {
-            pos = snprintf(line, sizeof(line), "  0x%02X  ", id);
-            for (int i = 0; i < buf_len; i++)
-                pos += snprintf(line + pos, sizeof(line) - pos, "%02X ", buf[i]);
-            pos += snprintf(line + pos, sizeof(line) - pos, " [");
-            for (int i = 0; i < buf_len; i++)
-                pos += snprintf(line + pos, sizeof(line) - pos, "%c",
-                    (buf[i] >= 0x20 && buf[i] < 0x7F) ? buf[i] : '.');
-            pos += snprintf(line + pos, sizeof(line) - pos, "]\r\n");
-            CMD_SEND(sock, line, pos);
-        } else {
-            uint8_t mf_data[SCAN_MAX_BLOCKS][LIN_MAX_DATA_LEN];
-            uint8_t mf_len[SCAN_MAX_BLOCKS];
-            uint8_t mf_count = 0;
-            uint8_t first_counter = buf[0];
-
-            memcpy(mf_data[mf_count], buf, buf_len);
-            mf_len[mf_count] = buf_len;
-            mf_count++;
-
-            for (int attempt = 0; attempt < SCAN_MAX_BLOCKS - 1; attempt++) {
-                vTaskDelay(pdMS_TO_TICKS(SCAN_INTER_FRAME_MS));
-                uint8_t nb[LIN_MAX_DATA_LEN + 1];
-                uint8_t nb_len = 0;
-                if (!scan_request(uart_num, id, nb, &nb_len)) break;
-                if (nb_len < 1) break;
-                if (nb[0] == first_counter) break;
-                memcpy(mf_data[mf_count], nb, nb_len);
-                mf_len[mf_count] = nb_len;
-                mf_count++;
-            }
-
-            pos = snprintf(line, sizeof(line),
-                "  0x%02X  MULTIFRAME  (%d Blöcke)\r\n", id, mf_count);
-            CMD_SEND(sock, line, pos);
-
-            char assembled[64] = {0};
-            int  asm_pos = 0;
-
-            for (int b = 0; b < mf_count; b++) {
-                pos = snprintf(line, sizeof(line), "         Block %02d: ", mf_data[b][0]);
-                for (int i = 1; i < mf_len[b]; i++) {
-                    pos += snprintf(line + pos, sizeof(line) - pos, "%02X ", mf_data[b][i]);
-                    if (mf_data[b][i] != 0x00 && asm_pos < (int)sizeof(assembled) - 1) {
-                        assembled[asm_pos++] =
-                            (mf_data[b][i] >= 0x20 && mf_data[b][i] < 0x7F)
-                            ? mf_data[b][i] : '.';
-                    }
-                }
-                pos += snprintf(line + pos, sizeof(line) - pos, "\r\n");
-                CMD_SEND(sock, line, pos);
-            }
-
-            if (asm_pos > 0) {
-                assembled[asm_pos] = '\0';
-                if (asm_pos >= 10 && asm_pos <= 12) {
-                    pos = snprintf(line, sizeof(line),
-                        "         → Part#: \"%.4s-%.6s-%.2s\"\r\n",
-                        assembled, assembled + 4, assembled + 10);
-                } else {
-                    pos = snprintf(line, sizeof(line),
-                        "         → ASCII: \"%s\"\r\n", assembled);
-                }
-                CMD_SEND(sock, line, pos);
-            }
-        }
-
+        scan_state.scan_id_done    = false;
+        scan_state.current_scan_id = id;
+        xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
+        lin_send_header(uart_num, id);
+        xSemaphoreGive(s_lin_tx_mutex);
+        led_indicator_send(LED_EVENT_LIN_TX);
         vTaskDelay(pdMS_TO_TICKS(SCAN_INTER_FRAME_MS));
     }
 
     pos = snprintf(line, sizeof(line),
         "══════════════════════════════════════════\r\n"
-        "Scan abgeschlossen. %d Frame-ID(s) aktiv.\r\n\r\n", found);
-    CMD_SEND(sock, line, pos);
+        "Scan complete.\r\n\r\n");
+    broadcast_to_clients(line, pos);
 }
+
+static void scan_task(void *pvParameters)
+{
+    lin_scan_bus(UART_NUM, scan_state.sock);
+    scan_state.active      = false;
+    scan_state.task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+// Filter
+// ═══════════════════════════════════════════════════════════════════
+
 
 // ═══════════════════════════════════════════════════════════════════
 // Slave Simulation
@@ -397,11 +416,10 @@ static void slave_sim_respond(uint8_t id)
     uart_write_bytes(UART_NUM, slave_state.data, slave_state.data_len);
     uart_write_bytes(UART_NUM, &checksum, 1);
 
-    stats.tx_frames++;
     led_indicator_send(LED_EVENT_LIN_TX);
 
     // Log to candump (broadcast goes via ring buffer, non-blocking)
-    output_candump(id, slave_state.data, slave_state.data_len,
+    output_frame(id, slave_state.data, slave_state.data_len,
                    LIN_CHECKSUM_ENHANCED, esp_timer_get_time(), "SIM");
 }
 
@@ -418,26 +436,58 @@ void poll_task(void *pvParameters)
                         ? (uint64_t)poll_state.duration_ms * 1000
                         : 0;
 
-    snprintf(buf, sizeof(buf), "POLL started: ID=0x%02X period=%lums%s\r\n",
+    if (poll_state.wake) {
+        snprintf(buf, sizeof(buf), "# WAKE: sending wakeup pulse...\r\n");
+        broadcast_to_clients(buf, strlen(buf));
+        xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
+        lin_send_wakeup(UART_NUM);
+        xSemaphoreGive(s_lin_tx_mutex);
+        vTaskDelay(pdMS_TO_TICKS(LIN_WAKEUP_WAIT_MS));
+        snprintf(buf, sizeof(buf), "# WAKE: slaves ready\r\n");
+        broadcast_to_clients(buf, strlen(buf));
+    }
+
+    snprintf(buf, sizeof(buf), "# POLL started: ID=0x%02X period=%lums%s\r\n",
              poll_state.id, poll_state.period_ms,
              (poll_state.count > 0)      ? " (count limit)" :
              (poll_state.duration_ms > 0) ? " (time limit)"  : " (endless)");
-    CMD_SEND(poll_state.sock, buf, strlen(buf));
+    broadcast_to_clients(buf, strlen(buf));
+
+    // Response window: wait this long for a slave reply before marking UNANSWERED
+    const uint32_t resp_wait_ms = LIN_BYTE_TIMEOUT_MS + 10;
 
     while (!poll_state.stop) {
         if (poll_state.count > 0 && count >= poll_state.count) break;
         if (limit_us > 0 && (esp_timer_get_time() - start_us) >= limit_us) break;
 
+        poll_state.rx_done = false;
+
+        xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
         lin_send_header(UART_NUM, poll_state.id);
+        xSemaphoreGive(s_lin_tx_mutex);
         led_indicator_send(LED_EVENT_LIN_TX);
-        stats.tx_frames++;
+
+        // Wait for response window (lets uart_event_task + parser fire lin_rx_callback)
+        uint32_t wait1 = (resp_wait_ms < poll_state.period_ms) ? resp_wait_ms : poll_state.period_ms;
+        vTaskDelay(pdMS_TO_TICKS(wait1));
+
+        // If no RX frame seen (no TX echo or silent slave), output UNANSWERED explicitly
+        if (!poll_state.rx_done) {
+            output_frame(poll_state.id, NULL, 0, LIN_CHECKSUM_CLASSIC,
+                         esp_timer_get_time(), "RX");
+            poll_state.rx_done = true;
+        }
+
         count++;
 
-        vTaskDelay(pdMS_TO_TICKS(poll_state.period_ms));
+        // Wait remaining period
+        if (poll_state.period_ms > wait1) {
+            vTaskDelay(pdMS_TO_TICKS(poll_state.period_ms - wait1));
+        }
     }
 
-    snprintf(buf, sizeof(buf), "POLL stopped: %lu frames sent\r\n", count);
-    CMD_SEND(poll_state.sock, buf, strlen(buf));
+    snprintf(buf, sizeof(buf), "# POLL stopped: %lu frames sent\r\n", count);
+    broadcast_to_clients(buf, strlen(buf));
 
     poll_state.active      = false;
     poll_state.task_handle = NULL;
@@ -453,12 +503,87 @@ static void poll_stop(void)
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// SEND-loop Task
+// ═══════════════════════════════════════════════════════════════════
+
+void send_loop_task(void *pvParameters)
+{
+    char buf[64];
+    uint32_t count    = 0;
+    uint64_t start_us = esp_timer_get_time();
+    uint64_t limit_us = (send_loop_state.duration_ms > 0)
+                        ? (uint64_t)send_loop_state.duration_ms * 1000
+                        : 0;
+
+    if (send_loop_state.wake) {
+        snprintf(buf, sizeof(buf), "# WAKE: sending wakeup pulse...\r\n");
+        broadcast_to_clients(buf, strlen(buf));
+        xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
+        lin_send_wakeup(UART_NUM);
+        xSemaphoreGive(s_lin_tx_mutex);
+        vTaskDelay(pdMS_TO_TICKS(LIN_WAKEUP_WAIT_MS));
+        snprintf(buf, sizeof(buf), "# WAKE: slaves ready\r\n");
+        broadcast_to_clients(buf, strlen(buf));
+    }
+
+    snprintf(buf, sizeof(buf), "# SEND loop started: ID=0x%02X period=%lums%s\r\n",
+             send_loop_state.id, send_loop_state.period_ms,
+             (send_loop_state.count > 0)       ? " (count limit)" :
+             (send_loop_state.duration_ms > 0) ? " (time limit)"  : " (endless)");
+    broadcast_to_clients(buf, strlen(buf));
+
+    lin_frame_t frame = {
+        .id            = send_loop_state.id,
+        .len           = send_loop_state.data_len,
+        .checksum_type = LIN_CHECKSUM_CLASSIC,
+    };
+    memcpy(frame.data, send_loop_state.data, send_loop_state.data_len);
+
+    while (!send_loop_state.stop) {
+        if (send_loop_state.count > 0 && count >= send_loop_state.count) break;
+        if (limit_us > 0 && (esp_timer_get_time() - start_us) >= limit_us) break;
+
+        xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
+        esp_err_t tx_err = lin_send_frame(UART_NUM, &frame);
+        xSemaphoreGive(s_lin_tx_mutex);
+        if (tx_err == ESP_OK) {
+            led_indicator_send(LED_EVENT_LIN_TX);
+            output_frame(frame.id, frame.data, frame.len,
+                         frame.checksum_type, esp_timer_get_time(), "TX");
+        }
+        count++;
+        vTaskDelay(pdMS_TO_TICKS(send_loop_state.period_ms));
+    }
+
+    snprintf(buf, sizeof(buf), "# SEND loop stopped: %lu frames sent\r\n", count);
+    broadcast_to_clients(buf, strlen(buf));
+
+    send_loop_state.active      = false;
+    send_loop_state.task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void send_loop_stop(void)
+{
+    if (!send_loop_state.active) return;
+    send_loop_state.stop = true;
+    uint32_t wait_ms = send_loop_state.period_ms * 2 + 100;
+    vTaskDelay(pdMS_TO_TICKS(wait_ms));
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Command Parser
 // ═══════════════════════════════════════════════════════════════════
 
 void parse_command(char *cmd, int sock)
 {
     char response[256];
+    char cmd_buf[256];
+    
+    // Copy to mutable buffer (cmd might be read-only)
+    strncpy(cmd_buf, cmd, sizeof(cmd_buf) - 1);
+    cmd_buf[sizeof(cmd_buf) - 1] = '\0';
+    cmd = cmd_buf;
 
     // Remove CR/LF
     for (char *p = cmd; *p; p++) {
@@ -478,62 +603,152 @@ void parse_command(char *cmd, int sock)
     if (strncmp(cmd, "HEADER ", 7) == 0) {
         uint8_t id = (uint8_t)strtol(cmd + 7, NULL, 16);
         if (id > 0x3F) {
-            snprintf(response, sizeof(response), "ERROR: ID must be 0x00-0x3F\r\n");
+            snprintf(response, sizeof(response), "# ERROR: ID must be 0x00-0x3F\r\n");
             CMD_SEND(sock, response, strlen(response));
             return;
         }
-        if (lin_send_header(UART_NUM, id) == ESP_OK) {
-            stats.tx_frames++;
+        xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
+        esp_err_t hdr_err = lin_send_header(UART_NUM, id);
+        xSemaphoreGive(s_lin_tx_mutex);
+        if (hdr_err == ESP_OK) {
             led_indicator_send(LED_EVENT_LIN_TX);
             snprintf(response, sizeof(response),
                      "HEADER sent for ID 0x%02X - watch for RX response\r\n", id);
         } else {
-            snprintf(response, sizeof(response), "ERROR\r\n");
+            snprintf(response, sizeof(response), "# ERROR\r\n");
         }
         CMD_SEND(sock, response, strlen(response));
     }
 
-    // SEND <ID> <data>
+    // SEND <ID> <data> [WAKE] [EVERY <ms> [<N>|<N>s]] [WAKE]
     else if (strncmp(cmd, "SEND ", 5) == 0) {
         lin_frame_t frame = { .checksum_type = LIN_CHECKSUM_CLASSIC };
         char *token = strtok(cmd + 5, " ");
         if (!token) {
-            snprintf(response, sizeof(response), "ERROR: SEND <ID> <data>\r\n");
+            snprintf(response, sizeof(response), "# ERROR: SEND <ID> <data>\r\n");
             CMD_SEND(sock, response, strlen(response));
             return;
         }
         frame.id = (uint8_t)strtol(token, NULL, 16);
-        while ((token = strtok(NULL, " ")) != NULL && frame.len < LIN_MAX_DATA_LEN) {
-            frame.data[frame.len++] = (uint8_t)strtol(token, NULL, 16);
+
+        char arg_every_ms[16]    = {0};
+        char arg_every_limit[16] = {0};
+        bool has_every = false;
+        bool has_wake  = false;
+
+        while ((token = strtok(NULL, " ")) != NULL) {
+            if (strcasecmp(token, "WAKE") == 0) {
+                has_wake = true;
+            } else if (strcasecmp(token, "EVERY") == 0) {
+                has_every = true;
+                char *t2 = strtok(NULL, " ");
+                char *t3 = strtok(NULL, " ");
+                char *t4 = strtok(NULL, " ");
+                if (t2 && strcasecmp(t2, "WAKE") == 0) { has_wake = true; t2 = NULL; }
+                if (t2) strncpy(arg_every_ms, t2, sizeof(arg_every_ms) - 1);
+                if (t3 && strcasecmp(t3, "WAKE") == 0) { has_wake = true; t3 = NULL; }
+                if (t3) strncpy(arg_every_limit, t3, sizeof(arg_every_limit) - 1);
+                if (t4 && strcasecmp(t4, "WAKE") == 0) has_wake = true;
+                break;
+            } else if (frame.len < LIN_MAX_DATA_LEN) {
+                frame.data[frame.len++] = (uint8_t)strtol(token, NULL, 16);
+            }
         }
-        if (lin_send_frame(UART_NUM, &frame) == ESP_OK) {
-            stats.tx_frames++;
-            led_indicator_send(LED_EVENT_LIN_TX);
-            output_candump(frame.id, frame.data, frame.len,
-                          frame.checksum_type, esp_timer_get_time(), "TX");
-            snprintf(response, sizeof(response), "OK\r\n");
+
+        if (frame.id > 0x3F) {
+            snprintf(response, sizeof(response), "# ERROR: ID must be 0x00-0x3F\r\n");
+            CMD_SEND(sock, response, strlen(response));
+            return;
+        }
+
+        if (!has_every) {
+            // Einzel-Send
+            if (has_wake) {
+                snprintf(response, sizeof(response), "# WAKE: sending wakeup pulse...\r\n");
+                CMD_SEND(sock, response, strlen(response));
+                xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
+                lin_send_wakeup(UART_NUM);
+                xSemaphoreGive(s_lin_tx_mutex);
+                vTaskDelay(pdMS_TO_TICKS(LIN_WAKEUP_WAIT_MS));
+                snprintf(response, sizeof(response), "# WAKE: slaves ready\r\n");
+                CMD_SEND(sock, response, strlen(response));
+            }
+            xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
+            esp_err_t snd_err = lin_send_frame(UART_NUM, &frame);
+            xSemaphoreGive(s_lin_tx_mutex);
+            if (snd_err == ESP_OK) {
+                led_indicator_send(LED_EVENT_LIN_TX);
+                output_frame(frame.id, frame.data, frame.len,
+                              frame.checksum_type, esp_timer_get_time(), "TX");
+                snprintf(response, sizeof(response), "# OK\r\n");
+            } else {
+                snprintf(response, sizeof(response), "# ERROR\r\n");
+            }
+            CMD_SEND(sock, response, strlen(response));
         } else {
-            snprintf(response, sizeof(response), "ERROR\r\n");
+            uint32_t period_ms = (uint32_t)strtoul(arg_every_ms, NULL, 10);
+            uint32_t count  = 0;
+            uint32_t dur_ms = 0;
+
+            if (strlen(arg_every_limit) > 0) {
+                size_t l = strlen(arg_every_limit);
+                if (arg_every_limit[l - 1] == 's') {
+                    arg_every_limit[l - 1] = '\0';
+                    dur_ms = (uint32_t)strtoul(arg_every_limit, NULL, 10) * 1000;
+                } else {
+                    count = (uint32_t)strtoul(arg_every_limit, NULL, 10);
+                }
+            }
+
+            if (period_ms < 10) {
+                snprintf(response, sizeof(response), "# ERROR: period_ms must be >= 10\r\n");
+                CMD_SEND(sock, response, strlen(response));
+                return;
+            }
+
+            send_loop_stop();
+
+            send_loop_state.id          = frame.id;
+            send_loop_state.data_len    = frame.len;
+            memcpy(send_loop_state.data, frame.data, frame.len);
+            send_loop_state.period_ms   = period_ms;
+            send_loop_state.count       = count;
+            send_loop_state.duration_ms = dur_ms;
+            send_loop_state.wake        = has_wake;
+            send_loop_state.sock        = sock;
+            send_loop_state.stop        = false;
+            send_loop_state.active      = true;
+
+            xTaskCreate(send_loop_task, "send_loop", 4096, NULL, 6,
+                        &send_loop_state.task_handle);
         }
-        CMD_SEND(sock, response, strlen(response));
     }
 
-    // POLL <ID> <period_ms> [<count> | <N>s]
+    // POLL <ID> <period_ms> [<count> | <N>s] [WAKE]
     else if (strncmp(cmd, "POLL ", 5) == 0) {
         char arg_id[8]      = {0};
         char arg_period[16] = {0};
         char arg_limit[16]  = {0};
+        char arg_wake[8]    = {0};
 
-        int parsed = sscanf(cmd + 5, "%7s %15s %15s", arg_id, arg_period, arg_limit);
+        int parsed = sscanf(cmd + 5, "%7s %15s %15s %7s",
+                            arg_id, arg_period, arg_limit, arg_wake);
         if (parsed < 2) {
             snprintf(response, sizeof(response),
-                     "ERROR: POLL <ID> <period_ms> [<count> | <N>s]\r\n");
+                     "ERROR: POLL <ID> <period_ms> [<count> | <N>s] [WAKE]\r\n");
             CMD_SEND(sock, response, strlen(response));
         } else {
             uint8_t  id        = (uint8_t)strtol(arg_id, NULL, 16);
             uint32_t period_ms = (uint32_t)strtoul(arg_period, NULL, 10);
             uint32_t count     = 0;
             uint32_t dur_ms    = 0;
+
+            // WAKE can appear as 3rd arg (instead of limit) or 4th arg
+            bool do_wake = (strcasecmp(arg_wake, "WAKE") == 0);
+            if (parsed >= 3 && strcasecmp(arg_limit, "WAKE") == 0) {
+                do_wake = true;
+                arg_limit[0] = '\0';
+            }
 
             if (parsed >= 3 && strlen(arg_limit) > 0) {
                 size_t llen = strlen(arg_limit);
@@ -546,10 +761,10 @@ void parse_command(char *cmd, int sock)
             }
 
             if (id > 0x3F) {
-                snprintf(response, sizeof(response), "ERROR: ID must be 0x00-0x3F\r\n");
+                snprintf(response, sizeof(response), "# ERROR: ID must be 0x00-0x3F\r\n");
                 CMD_SEND(sock, response, strlen(response));
             } else if (period_ms < 10) {
-                snprintf(response, sizeof(response), "ERROR: period_ms must be >= 10\r\n");
+                snprintf(response, sizeof(response), "# ERROR: period_ms must be >= 10\r\n");
                 CMD_SEND(sock, response, strlen(response));
             } else {
                 poll_stop();  // Alten POLL stoppen falls aktiv
@@ -558,21 +773,54 @@ void parse_command(char *cmd, int sock)
                 poll_state.period_ms   = period_ms;
                 poll_state.count       = count;
                 poll_state.duration_ms = dur_ms;
+                poll_state.wake        = do_wake;
                 poll_state.sock        = sock;
                 poll_state.stop        = false;
                 poll_state.active      = true;
 
-                xTaskCreate(poll_task, "poll", 2048, NULL, 6, &poll_state.task_handle);
+                xTaskCreate(poll_task, "poll", 4096, NULL, 6, &poll_state.task_handle);
             }
         }
     }
 
     // STOP
+    // FILTER <ID> [<ID> ...]
+    else if (strncmp(cmd, "FILTER ", 7) == 0) {
+        char *token = strtok(cmd + 7, " ");
+        uint8_t ids[64];
+        uint8_t count = 0;
+
+        while (token && count < 64) {
+            uint8_t id = (uint8_t)strtol(token, NULL, 16);
+            if (id > 0x3F) {
+                snprintf(response, sizeof(response), "# ERROR: ID 0x%02X out of range\r\n", id);
+                CMD_SEND(sock, response, strlen(response));
+                return;
+            }
+            ids[count++] = id;
+            token = strtok(NULL, " ");
+        }
+
+        if (count == 0) {
+            snprintf(response, sizeof(response), "# ERROR: FILTER <ID> [<ID> ...]\r\n");
+            CMD_SEND(sock, response, strlen(response));
+        } else {
+            // Atomic update
+            filter_state.active = false;
+            filter_state.count  = count;
+            memcpy(filter_state.ids, ids, count);
+            filter_state.active = true;
+
+            snprintf(response, sizeof(response), "# FILTER active: %d ID(s)\r\n", count);
+            CMD_SEND(sock, response, strlen(response));
+        }
+    }
+
     // SLAVE <ID> <byte> [<byte> ...]
     else if (strncmp(cmd, "SLAVE ", 6) == 0) {
         char *token = strtok(cmd + 6, " ");
         if (!token) {
-            snprintf(response, sizeof(response), "ERROR: SLAVE <ID> <byte> ...\r\n");
+            snprintf(response, sizeof(response), "# ERROR: SLAVE <ID> <byte> ...\r\n");
             CMD_SEND(sock, response, strlen(response));
         } else {
             uint8_t id  = (uint8_t)strtol(token, NULL, 16);
@@ -584,9 +832,9 @@ void parse_command(char *cmd, int sock)
             }
 
             if (id > 0x3F) {
-                snprintf(response, sizeof(response), "ERROR: ID must be 0x00-0x3F\r\n");
+                snprintf(response, sizeof(response), "# ERROR: ID must be 0x00-0x3F\r\n");
             } else if (len == 0) {
-                snprintf(response, sizeof(response), "ERROR: at least 1 data byte required\r\n");
+                snprintf(response, sizeof(response), "# ERROR: at least 1 data byte required\r\n");
             } else {
                 // Activate - atomic update
                 slave_state.active   = false;  // pause before update
@@ -603,21 +851,40 @@ void parse_command(char *cmd, int sock)
     }
 
     else if (strcmp(cmd, "STOP") == 0) {
-        bool stopped_poll  = poll_state.active;
-        bool stopped_slave = slave_state.active;
+        bool stopped_poll   = poll_state.active;
+        bool stopped_send   = send_loop_state.active;
+        bool stopped_slave  = slave_state.active;
+        bool stopped_filter = filter_state.active;
 
-        if (stopped_poll)  poll_stop();
-        if (stopped_slave) slave_state.active = false;
+        if (stopped_poll)   poll_stop();
+        if (stopped_send)   send_loop_stop();
+        if (stopped_slave)  slave_state.active = false;
+        if (stopped_filter) filter_state.active = false;
 
-        if (stopped_poll && stopped_slave)
-            snprintf(response, sizeof(response), "POLL and SLAVE stopped\r\n");
-        else if (stopped_poll)
-            snprintf(response, sizeof(response), "POLL stopped\r\n");
-        else if (stopped_slave)
-            snprintf(response, sizeof(response), "SLAVE sim stopped\r\n");
+        char msg[128] = "";
+        int n = 0;
+        if (stopped_poll)   n += snprintf(msg + n, sizeof(msg) - n, "POLL");
+        if (stopped_send)   n += snprintf(msg + n, sizeof(msg) - n, "%sSEND", n?" and ":"");
+        if (stopped_slave)  n += snprintf(msg + n, sizeof(msg) - n, "%sSLAVE", n?" and ":"");
+        if (stopped_filter) n += snprintf(msg + n, sizeof(msg) - n, "%sFILTER", n?" and ":"");
+
+        if (n > 0)
+            snprintf(response, sizeof(response), "# %s stopped\r\n", msg);
         else
-            snprintf(response, sizeof(response), "Nothing running\r\n");
+            snprintf(response, sizeof(response), "# Nothing running\r\n");
 
+        CMD_SEND(sock, response, strlen(response));
+    }
+
+    // WAKE
+    else if (strcmp(cmd, "WAKE") == 0) {
+        snprintf(response, sizeof(response), "# WAKE: sending wakeup pulse...\r\n");
+        CMD_SEND(sock, response, strlen(response));
+        xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
+        lin_send_wakeup(UART_NUM);
+        xSemaphoreGive(s_lin_tx_mutex);
+        vTaskDelay(pdMS_TO_TICKS(LIN_WAKEUP_WAIT_MS));
+        snprintf(response, sizeof(response), "# WAKE: slaves ready\r\n");
         CMD_SEND(sock, response, strlen(response));
     }
 
@@ -626,31 +893,22 @@ void parse_command(char *cmd, int sock)
         char *ssid     = strtok(cmd + 5, " ");
         char *password = strtok(NULL, " ");
         if (!ssid || !password) {
-            snprintf(response, sizeof(response), "ERROR: WIFI <SSID> <PASSWORD>\r\n");
+            snprintf(response, sizeof(response), "# ERROR: WIFI <SSID> <PASSWORD>\r\n");
         } else if (wifi_set_credentials(ssid, password)) {
-            snprintf(response, sizeof(response), "OK: Rebooting...\r\n");
+            snprintf(response, sizeof(response), "# OK: Rebooting...\r\n");
             CMD_SEND(sock, response, strlen(response));
             vTaskDelay(pdMS_TO_TICKS(500));
             esp_restart();
             return;
         } else {
-            snprintf(response, sizeof(response), "ERROR\r\n");
+            snprintf(response, sizeof(response), "# ERROR\r\n");
         }
-        CMD_SEND(sock, response, strlen(response));
-    }
-
-    // STATUS
-    else if (strcmp(cmd, "STATUS") == 0) {
-        snprintf(response, sizeof(response),
-                 "RX: %lu  TX: %lu  Valid: %lu  Unanswered: %lu\r\n",
-                 stats.total_frames, stats.tx_frames, stats.valid_frames,
-                 stats.unanswered_frames);
         CMD_SEND(sock, response, strlen(response));
     }
 
     // REBOOT
     else if (strcmp(cmd, "REBOOT") == 0) {
-        snprintf(response, sizeof(response), "Rebooting...\r\n");
+        snprintf(response, sizeof(response), "# Rebooting...\r\n");
         CMD_SEND(sock, response, strlen(response));
         vTaskDelay(pdMS_TO_TICKS(1000));
         esp_restart();
@@ -658,21 +916,66 @@ void parse_command(char *cmd, int sock)
 
     // SCAN
     else if (strcmp(cmd, "SCAN") == 0) {
-        snprintf(response, sizeof(response), "Scanning IDs 0x00-0x3F ...\r\n");
+        if (scan_state.active) {
+            snprintf(response, sizeof(response), "# ERROR: SCAN already running\r\n");
+            CMD_SEND(sock, response, strlen(response));
+        } else {
+            scan_state.sock   = sock;
+            scan_state.active = true;
+            xTaskCreate(scan_task, "scan", 3072, NULL, 5, &scan_state.task_handle);
+        }
+    }
+
+    // FORMAT <type>
+    else if (strncmp(cmd, "FORMAT ", 7) == 0) {
+        char *format_str = cmd + 7;
+        // Convert format to uppercase for comparison
+        for (char *p = format_str; *p; p++) {
+            *p = (char)toupper((unsigned char)*p);
+        }
+        
+        if (strcmp(format_str, "CANDUMP") == 0) {
+            current_format = LOG_FORMAT_CANDUMP;
+            snprintf(response, sizeof(response), "# Format: CANDUMP\r\n");
+        } else if (strcmp(format_str, "HUMAN") == 0) {
+            current_format = LOG_FORMAT_HUMAN;
+            snprintf(response, sizeof(response), "# Format: HUMAN\r\n");
+        } else {
+            snprintf(response, sizeof(response), "# ERROR: FORMAT CANDUMP | FORMAT HUMAN\r\n");
+        }
         CMD_SEND(sock, response, strlen(response));
-        lin_scan_bus(UART_NUM, sock);
     }
 
     // HELP
     else if (strcmp(cmd, "HELP") == 0) {
+        const char *help_text =
+            "Available commands:\r\n"
+            "  HEADER <ID>                  - Send LIN header, listen for response\r\n"
+            "  SEND <ID> <data> [WAKE]      - Send complete LIN frame\r\n"
+            "  SEND <ID> <data> [WAKE] EVERY <ms> [<N>|<N>s] - Send frame repeatedly\r\n"
+            "  POLL <ID> <ms> [<N>|<N>s] [WAKE] - Poll ID every N ms\r\n"
+            "  WAKE                         - Send wakeup pulse, wait 100ms\r\n"
+            "  SLAVE <ID> <data>            - Simulate LIN slave response\r\n"
+            "  FILTER <ID> [<ID>...]        - Show only specified IDs\r\n"
+            "  FORMAT CANDUMP | FORMAT HUMAN - Set output format\r\n"
+            "  STOP                         - Stop POLL/SEND/SLAVE/FILTER\r\n"
+            "  SCAN                         - Scan all IDs 0x00-0x3F\r\n"
+            "  WIFI <SSID> <PW>             - Set WiFi credentials and reboot\r\n"
+            "  REBOOT                       - Restart device\r\n"
+            "  IDENTIFY                     - Show device type, version and buses\r\n"
+            "  HELP                         - Show this help\r\n";
+        CMD_SEND(sock, help_text, strlen(help_text));
+    }
+
+    // IDENTIFY
+    else if (strcmp(cmd, "IDENTIFY") == 0) {
         snprintf(response, sizeof(response),
-                 "HEADER <ID> | SEND <ID> <data> | POLL <ID> <ms> [<count>|<N>s] | SLAVE <ID> <data> | STOP"
-                 " | SCAN | WIFI <SSID> <PW> | STATUS | REBOOT | HELP\r\n");
+                 "# Type: LIN, Version: " LIN_SNIFFER_VERSION ", Buses: " LIN_BUS_NAMES "\r\n");
         CMD_SEND(sock, response, strlen(response));
     }
 
     else {
-        snprintf(response, sizeof(response), "ERROR: Type HELP\r\n");
+        snprintf(response, sizeof(response), "# ERROR: Type HELP\r\n");
         CMD_SEND(sock, response, strlen(response));
     }
 }
@@ -734,7 +1037,7 @@ void client_handler_task(void *pvParameters)
     int sock = (int)pvParameters;
 
     ringbuf_reader_t reader;
-    ringbuf_reader_init_from_history(&reader, 50);
+    ringbuf_reader_init_from_history(&reader, CONFIG_WS_RECONNECT_HISTORY_LINES);
 
     struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -769,7 +1072,7 @@ disconnect:
             break;
         }
     }
-    ESP_LOGI(TAG, "Telnet Client getrennt (sock=%d)", sock);
+    ESP_LOGI(TAG, "Telnet client disconnected (sock=%d)", sock);
     vTaskDelete(NULL);
 }
 
@@ -816,10 +1119,8 @@ void tcp_server_task(void *pvParameters)
             ESP_LOGI(TAG, "Client %d connected", slot);
             char welcome[128];
             snprintf(welcome, sizeof(welcome),
-                     "# LIN Sniffer v" LIN_SNIFFER_VERSION "\r\n");
+                     "# LIN Sniffer v" LIN_SNIFFER_VERSION " (type HELP for commands)\r\n");
             send(sock, welcome, strlen(welcome), 0);
-            // HELP direkt beim Connect ausgeben
-            parse_command("HELP", sock);
             xTaskCreate(client_handler_task, "client", 4096, (void*)sock, 5, NULL);
         } else {
             close(sock);
@@ -827,14 +1128,7 @@ void tcp_server_task(void *pvParameters)
     }
 }
 
-void statistics_task(void *pvParameters)
-{
-    while(1) {
-        vTaskDelay(pdMS_TO_TICKS(30000));
-        ESP_LOGI(TAG, "Stats: RX:%lu TX:%lu Valid:%lu",
-                 stats.total_frames, stats.tx_frames, stats.valid_frames);
-    }
-}
+
 
 // ═══════════════════════════════════════════════════════════════════
 // WiFi
@@ -859,7 +1153,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             vTaskDelay(pdMS_TO_TICKS(1000 * wifi_retry_count));
             esp_wifi_connect();
         } else {
-            ESP_LOGE(TAG, "WiFi fehlgeschlagen nach %d Versuchen — wechsle zu AP-Mode",
+            ESP_LOGE(TAG, "WiFi failed after %d attempts - switching to AP mode",
                      WIFI_MAX_RETRY);
             led_indicator_send(LED_EVENT_WIFI_ERROR);
             vTaskDelay(pdMS_TO_TICKS(2000));
@@ -998,6 +1292,7 @@ void app_main(void)
     ESP_LOGI(TAG, "LIN Sniffer starting...");
 
     boot_timestamp_us = esp_timer_get_time();
+    s_lin_tx_mutex = xSemaphoreCreateMutex();
     ringbuf_init();
     led_indicator_init();
 
@@ -1010,7 +1305,6 @@ void app_main(void)
     ESP_LOGI(TAG, "LIN UART ready");
 
     xTaskCreate(uart_event_task, "uart",  4096, NULL, 12, NULL);
-    xTaskCreate(statistics_task, "stats", 2048, NULL,  3, NULL);
 
     wifi_init();
 

@@ -39,7 +39,7 @@ static const char *TAG = "LED";
 typedef struct { uint8_t r, g, b; } rgb_t;
 
 // Grundfarben (bei Vollhelligkeit 255)
-#define COLOR_GREEN    ((rgb_t){0,   255, 0  })
+#define COLOR_GREEN    ((rgb_t){0,   125, 0  })
 #define COLOR_BLUE     ((rgb_t){0,   0,   255})
 #define COLOR_YELLOW   ((rgb_t){255, 180, 0  })
 #define COLOR_RED      ((rgb_t){255, 0,   0  })
