@@ -108,6 +108,7 @@
 <div id="header">
   <div id="status"></div>
   <h1>LIN Sniffer</h1>
+  <span id="version" style="color:#666;font-size:11px"></span>
   <button id="connbtn" onclick="toggleConn()" style="background:#4caf50;font-size:11px;padding:4px 10px">Connect</button>
   <span id="ip" style="color:#888;font-size:11px"></span>
   <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
@@ -136,6 +137,10 @@ const connbtn = document.getElementById('connbtn');
 
 let ws, autoScroll = true, pendingReload = false,
     cmdHistory = [], historyPos = -1, historyDraft = '';
+
+fetch('/api/version').then(r => r.text()).then(v => {
+  document.getElementById('version').textContent = 'v' + v;
+});
 
 // ── Log output ────────────────────────────────────────────────────
 

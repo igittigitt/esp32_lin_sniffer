@@ -58,6 +58,14 @@ static esp_err_t handler_root(httpd_req_t *req)
                            app_html_end - app_html_start);
 }
 
+// ── HTTP Handler: GET /api/version ───────────────────────────────
+
+static esp_err_t handler_version(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_sendstr(req, LIN_SNIFFER_VERSION);
+}
+
 // ── HTTP Handler: POST /ota ───────────────────────────────────────
 
 static esp_err_t handler_ota(httpd_req_t *req)
@@ -322,6 +330,13 @@ void web_server_start(void)
         .handle_ws_control_frames = false,
     };
     httpd_register_uri_handler(s_server, &uri_ws);
+
+    static const httpd_uri_t uri_version = {
+        .uri     = "/api/version",
+        .method  = HTTP_GET,
+        .handler = handler_version,
+    };
+    httpd_register_uri_handler(s_server, &uri_version);
 
     xTaskCreate(ws_push_task, "ws_push", 4096, NULL, 4, NULL);
 
