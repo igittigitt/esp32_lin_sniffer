@@ -125,6 +125,10 @@ static struct {
     uint32_t      duration_ms;  // 0 = use count, >0 = run for N ms
     bool          wake;         // send wakeup pulse before first frame
     int           sock;
+    bool          has_header;        // after each frame, send header for header_id
+    uint8_t       header_id;         // LIN ID to query after each frame
+    volatile bool header_active;     // true while waiting for header response
+    volatile bool header_rx_done;    // response received in current header cycle
 } send_loop_state = {0};
 
 // ── SLAVE simulation state ────────────────────────────────────────
@@ -287,6 +291,11 @@ void lin_rx_callback(uint8_t id, const uint8_t *data, uint8_t len,
     if (poll_state.active && id == poll_state.id) {
         if (poll_state.rx_done) return;
         poll_state.rx_done = true;
+    // During SEND loop with HEADER: bypass filter, suppress duplicates per cycle
+    // header_active is only true AFTER the header has been sent
+    } else if (send_loop_state.header_active && id == send_loop_state.header_id) {
+        if (send_loop_state.header_rx_done) return;
+        send_loop_state.header_rx_done = true;
     } else {
         // Filter check: skip if not in allowed list
         if (!filter_check(id)) return;
@@ -548,11 +557,35 @@ void send_loop_task(void *pvParameters)
         xSemaphoreGive(s_lin_tx_mutex);
         if (tx_err == ESP_OK) {
             led_indicator_send(LED_EVENT_LIN_TX);
-            output_frame(frame.id, frame.data, frame.len,
-                         frame.checksum_type, esp_timer_get_time(), "TX");
         }
         count++;
-        vTaskDelay(pdMS_TO_TICKS(send_loop_state.period_ms));
+
+        if (send_loop_state.has_header) {
+            vTaskDelay(pdMS_TO_TICKS(2));   // inter-frame gap
+
+            send_loop_state.header_rx_done = false;
+            xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
+            lin_send_header(UART_NUM, send_loop_state.header_id);
+            xSemaphoreGive(s_lin_tx_mutex);
+            led_indicator_send(LED_EVENT_LIN_TX);
+            send_loop_state.header_active = true;   // accept responses now
+
+            uint32_t resp_wait = LIN_BYTE_TIMEOUT_MS + 10;
+            vTaskDelay(pdMS_TO_TICKS(resp_wait));
+
+            send_loop_state.header_active = false;
+            if (!send_loop_state.header_rx_done) {
+                output_frame(send_loop_state.header_id, NULL, 0,
+                             LIN_CHECKSUM_CLASSIC, esp_timer_get_time(), "RX");
+            }
+
+            uint32_t overhead = 2 + resp_wait;
+            uint32_t remain = (send_loop_state.period_ms > overhead)
+                              ? send_loop_state.period_ms - overhead : 1;
+            vTaskDelay(pdMS_TO_TICKS(remain));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(send_loop_state.period_ms));
+        }
     }
 
     snprintf(buf, sizeof(buf), "# SEND loop stopped: %lu frames sent\r\n", count);
@@ -633,22 +666,38 @@ void parse_command(char *cmd, int sock)
 
         char arg_every_ms[16]    = {0};
         char arg_every_limit[16] = {0};
-        bool has_every = false;
-        bool has_wake  = false;
+        bool has_every  = false;
+        bool has_wake   = false;
+        bool has_header = false;
+        uint8_t header_id = 0;
 
         while ((token = strtok(NULL, " ")) != NULL) {
             if (strcasecmp(token, "WAKE") == 0) {
                 has_wake = true;
+            } else if (strcasecmp(token, "HEADER") == 0) {
+                has_header = true;
+                char *tid = strtok(NULL, " ");
+                if (tid) header_id = (uint8_t)strtol(tid, NULL, 16);
             } else if (strcasecmp(token, "EVERY") == 0) {
                 has_every = true;
                 char *t2 = strtok(NULL, " ");
                 char *t3 = strtok(NULL, " ");
                 char *t4 = strtok(NULL, " ");
+                char *t5 = strtok(NULL, " ");
                 if (t2 && strcasecmp(t2, "WAKE") == 0) { has_wake = true; t2 = NULL; }
                 if (t2) strncpy(arg_every_ms, t2, sizeof(arg_every_ms) - 1);
                 if (t3 && strcasecmp(t3, "WAKE") == 0) { has_wake = true; t3 = NULL; }
+                else if (t3 && strcasecmp(t3, "HEADER") == 0) {
+                    has_header = true;
+                    if (t4) header_id = (uint8_t)strtol(t4, NULL, 16);
+                    t3 = NULL;   // not a limit
+                }
                 if (t3) strncpy(arg_every_limit, t3, sizeof(arg_every_limit) - 1);
                 if (t4 && strcasecmp(t4, "WAKE") == 0) has_wake = true;
+                else if (t4 && strcasecmp(t4, "HEADER") == 0) {
+                    has_header = true;
+                    if (t5) header_id = (uint8_t)strtol(t5, NULL, 16);
+                }
                 break;
             } else if (frame.len < LIN_MAX_DATA_LEN) {
                 frame.data[frame.len++] = (uint8_t)strtol(token, NULL, 16);
@@ -678,8 +727,22 @@ void parse_command(char *cmd, int sock)
             xSemaphoreGive(s_lin_tx_mutex);
             if (snd_err == ESP_OK) {
                 led_indicator_send(LED_EVENT_LIN_TX);
-                output_frame(frame.id, frame.data, frame.len,
-                              frame.checksum_type, esp_timer_get_time(), "TX");
+                if (has_header) {
+                    vTaskDelay(pdMS_TO_TICKS(2));
+                    send_loop_state.header_id      = header_id;
+                    send_loop_state.header_rx_done = false;
+                    xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
+                    lin_send_header(UART_NUM, header_id);
+                    xSemaphoreGive(s_lin_tx_mutex);
+                    led_indicator_send(LED_EVENT_LIN_TX);
+                    send_loop_state.header_active = true;
+                    vTaskDelay(pdMS_TO_TICKS(LIN_BYTE_TIMEOUT_MS + 10));
+                    send_loop_state.header_active = false;
+                    if (!send_loop_state.header_rx_done) {
+                        output_frame(header_id, NULL, 0,
+                                     LIN_CHECKSUM_CLASSIC, esp_timer_get_time(), "RX");
+                    }
+                }
                 snprintf(response, sizeof(response), "# OK\r\n");
             } else {
                 snprintf(response, sizeof(response), "# ERROR\r\n");
@@ -708,16 +771,19 @@ void parse_command(char *cmd, int sock)
 
             send_loop_stop();
 
-            send_loop_state.id          = frame.id;
-            send_loop_state.data_len    = frame.len;
+            send_loop_state.id              = frame.id;
+            send_loop_state.data_len        = frame.len;
             memcpy(send_loop_state.data, frame.data, frame.len);
-            send_loop_state.period_ms   = period_ms;
-            send_loop_state.count       = count;
-            send_loop_state.duration_ms = dur_ms;
-            send_loop_state.wake        = has_wake;
-            send_loop_state.sock        = sock;
-            send_loop_state.stop        = false;
-            send_loop_state.active      = true;
+            send_loop_state.period_ms       = period_ms;
+            send_loop_state.count           = count;
+            send_loop_state.duration_ms     = dur_ms;
+            send_loop_state.wake            = has_wake;
+            send_loop_state.sock            = sock;
+            send_loop_state.has_header      = has_header;
+            send_loop_state.header_id       = header_id;
+            send_loop_state.header_rx_done  = false;
+            send_loop_state.stop            = false;
+            send_loop_state.active          = true;
 
             xTaskCreate(send_loop_task, "send_loop", 4096, NULL, 6,
                         &send_loop_state.task_handle);
@@ -948,23 +1014,27 @@ void parse_command(char *cmd, int sock)
 
     // HELP
     else if (strcmp(cmd, "HELP") == 0) {
-        const char *help_text =
-            "Available commands:\r\n"
-            "  HEADER <ID>                  - Send LIN header, listen for response\r\n"
-            "  SEND <ID> <data> [WAKE]      - Send complete LIN frame\r\n"
-            "  SEND <ID> <data> [WAKE] EVERY <ms> [<N>|<N>s] - Send frame repeatedly\r\n"
-            "  POLL <ID> <ms> [<N>|<N>s] [WAKE] - Poll ID every N ms\r\n"
-            "  WAKE                         - Send wakeup pulse, wait 100ms\r\n"
-            "  SLAVE <ID> <data>            - Simulate LIN slave response\r\n"
-            "  FILTER <ID> [<ID>...]        - Show only specified IDs\r\n"
-            "  FORMAT CANDUMP | FORMAT HUMAN - Set output format\r\n"
-            "  STOP                         - Stop POLL/SEND/SLAVE/FILTER\r\n"
-            "  SCAN                         - Scan all IDs 0x00-0x3F\r\n"
-            "  WIFI <SSID> <PW>             - Set WiFi credentials and reboot\r\n"
-            "  REBOOT                       - Restart device\r\n"
-            "  IDENTIFY                     - Show device type, version and buses\r\n"
-            "  HELP                         - Show this help\r\n";
-        CMD_SEND(sock, help_text, strlen(help_text));
+        // Send line-by-line: each line fits within RINGBUF_ENTRY_SIZE (160 bytes)
+        static const char * const help_lines[] = {
+            "Available commands:\r\n",
+            "  HEADER <ID>                  - Send LIN header, listen for response\r\n",
+            "  SEND <ID> <data> [WAKE]      - Send complete LIN frame\r\n",
+            "  SEND <ID> <data> [WAKE] EVERY <ms> [<N>|<N>s] [HEADER <ID>] - Send frame repeatedly\r\n",
+            "  POLL <ID> <ms> [<N>|<N>s] [WAKE] - Poll ID every N ms\r\n",
+            "  WAKE                         - Send wakeup pulse, wait 100ms\r\n",
+            "  SLAVE <ID> <data>            - Simulate LIN slave response\r\n",
+            "  FILTER <ID> [<ID>...]        - Show only specified IDs\r\n",
+            "  FORMAT CANDUMP | FORMAT HUMAN - Set output format\r\n",
+            "  STOP                         - Stop POLL/SEND/SLAVE/FILTER\r\n",
+            "  SCAN                         - Scan all IDs 0x00-0x3F\r\n",
+            "  WIFI <SSID> <PW>             - Set WiFi credentials and reboot\r\n",
+            "  REBOOT                       - Restart device\r\n",
+            "  IDENTIFY                     - Show device type, version and buses\r\n",
+            "  HELP                         - Show this help\r\n",
+        };
+        for (int i = 0; i < (int)(sizeof(help_lines) / sizeof(help_lines[0])); i++) {
+            CMD_SEND(sock, help_lines[i], strlen(help_lines[i]));
+        }
     }
 
     // IDENTIFY

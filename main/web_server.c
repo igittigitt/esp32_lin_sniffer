@@ -98,7 +98,7 @@ static const char TERMINAL_HTML[] =
 "<script>"
 "const log=document.getElementById('log');"
 "const status=document.getElementById('status');"
-"let ws,autoScroll=true;"
+"let ws,autoScroll=true,pendingReload=false,cmdHistory=[],historyPos=-1,historyDraft='';"
 "const connbtn=document.getElementById('connbtn');"
 ""
 "function appendLine(text,cls){"
