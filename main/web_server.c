@@ -482,6 +482,7 @@ static esp_err_t handler_ws(httpd_req_t *req)
 
 static void ws_push_task(void *pvParameters)
 {
+    static char batch[4096];
     char msg[RINGBUF_ENTRY_SIZE];
 
     while (1) {
@@ -492,23 +493,47 @@ static void ws_push_task(void *pvParameters)
         for (int i = 0; i < WS_MAX_CLIENTS; i++) {
             if (s_ws_clients[i].fd == -1) continue;
 
-            size_t len = 0;
+            size_t len       = 0;
+            size_t batch_len = 0;
+
             while (ringbuf_read(&s_ws_clients[i].reader, msg, &len)) {
+                if (batch_len + len > sizeof(batch)) {
+                    httpd_ws_frame_t pkt = {
+                        .type    = HTTPD_WS_TYPE_TEXT,
+                        .payload = (uint8_t *)batch,
+                        .len     = batch_len,
+                    };
+                    esp_err_t err = httpd_ws_send_frame_async(
+                        s_server, s_ws_clients[i].fd, &pkt);
+                    if (err != ESP_OK) {
+                        ESP_LOGW(TAG, "WS send fd=%d failed, removing client",
+                                 s_ws_clients[i].fd);
+                        s_ws_clients[i].fd = -1;
+                        batch_len = 0;
+                        break;
+                    }
+                    any_sent  = true;
+                    batch_len = 0;
+                }
+                memcpy(batch + batch_len, msg, len);
+                batch_len += len;
+            }
+
+            if (s_ws_clients[i].fd != -1 && batch_len > 0) {
                 httpd_ws_frame_t pkt = {
                     .type    = HTTPD_WS_TYPE_TEXT,
-                    .payload = (uint8_t *)msg,
-                    .len     = len,
+                    .payload = (uint8_t *)batch,
+                    .len     = batch_len,
                 };
                 esp_err_t err = httpd_ws_send_frame_async(
                     s_server, s_ws_clients[i].fd, &pkt);
-
                 if (err != ESP_OK) {
                     ESP_LOGW(TAG, "WS send fd=%d failed, removing client",
                              s_ws_clients[i].fd);
                     s_ws_clients[i].fd = -1;
-                    break;
+                } else {
+                    any_sent = true;
                 }
-                any_sent = true;
             }
         }
 
