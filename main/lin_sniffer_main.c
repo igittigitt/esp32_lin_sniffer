@@ -157,6 +157,9 @@ static struct {
     int              sock;
 } scan_state = {0};
 
+// ── LIN TX Mutex (serializes concurrent UART TX from multiple tasks) ──
+static SemaphoreHandle_t s_lin_tx_mutex = NULL;
+
 // ── LOG state ─────────────────────────────────────────────────────
 typedef enum {
     LOG_FORMAT_CANDUMP,
@@ -366,7 +369,9 @@ static void lin_scan_bus(uart_port_t uart_num, int sock)
     for (uint8_t id = 0x00; id <= 0x3F; id++) {
         scan_state.scan_id_done    = false;
         scan_state.current_scan_id = id;
+        xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
         lin_send_header(uart_num, id);
+        xSemaphoreGive(s_lin_tx_mutex);
         led_indicator_send(LED_EVENT_LIN_TX);
         vTaskDelay(pdMS_TO_TICKS(SCAN_INTER_FRAME_MS));
     }
@@ -434,7 +439,9 @@ void poll_task(void *pvParameters)
     if (poll_state.wake) {
         snprintf(buf, sizeof(buf), "# WAKE: sending wakeup pulse...\r\n");
         CMD_SEND(poll_state.sock, buf, strlen(buf));
+        xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
         lin_send_wakeup(UART_NUM);
+        xSemaphoreGive(s_lin_tx_mutex);
         vTaskDelay(pdMS_TO_TICKS(LIN_WAKEUP_WAIT_MS));
         snprintf(buf, sizeof(buf), "# WAKE: slaves ready\r\n");
         CMD_SEND(poll_state.sock, buf, strlen(buf));
@@ -450,7 +457,9 @@ void poll_task(void *pvParameters)
         if (poll_state.count > 0 && count >= poll_state.count) break;
         if (limit_us > 0 && (esp_timer_get_time() - start_us) >= limit_us) break;
 
+        xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
         lin_send_header(UART_NUM, poll_state.id);
+        xSemaphoreGive(s_lin_tx_mutex);
         led_indicator_send(LED_EVENT_LIN_TX);
         count++;
 
@@ -489,7 +498,9 @@ void send_loop_task(void *pvParameters)
     if (send_loop_state.wake) {
         snprintf(buf, sizeof(buf), "# WAKE: sending wakeup pulse...\r\n");
         CMD_SEND(send_loop_state.sock, buf, strlen(buf));
+        xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
         lin_send_wakeup(UART_NUM);
+        xSemaphoreGive(s_lin_tx_mutex);
         vTaskDelay(pdMS_TO_TICKS(LIN_WAKEUP_WAIT_MS));
         snprintf(buf, sizeof(buf), "# WAKE: slaves ready\r\n");
         CMD_SEND(send_loop_state.sock, buf, strlen(buf));
@@ -512,7 +523,10 @@ void send_loop_task(void *pvParameters)
         if (send_loop_state.count > 0 && count >= send_loop_state.count) break;
         if (limit_us > 0 && (esp_timer_get_time() - start_us) >= limit_us) break;
 
-        if (lin_send_frame(UART_NUM, &frame) == ESP_OK) {
+        xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
+        esp_err_t tx_err = lin_send_frame(UART_NUM, &frame);
+        xSemaphoreGive(s_lin_tx_mutex);
+        if (tx_err == ESP_OK) {
             led_indicator_send(LED_EVENT_LIN_TX);
             output_frame(frame.id, frame.data, frame.len,
                          frame.checksum_type, esp_timer_get_time(), "TX");
@@ -573,7 +587,10 @@ void parse_command(char *cmd, int sock)
             CMD_SEND(sock, response, strlen(response));
             return;
         }
-        if (lin_send_header(UART_NUM, id) == ESP_OK) {
+        xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
+        esp_err_t hdr_err = lin_send_header(UART_NUM, id);
+        xSemaphoreGive(s_lin_tx_mutex);
+        if (hdr_err == ESP_OK) {
             led_indicator_send(LED_EVENT_LIN_TX);
             snprintf(response, sizeof(response),
                      "HEADER sent for ID 0x%02X - watch for RX response\r\n", id);
@@ -629,12 +646,17 @@ void parse_command(char *cmd, int sock)
             if (has_wake) {
                 snprintf(response, sizeof(response), "# WAKE: sending wakeup pulse...\r\n");
                 CMD_SEND(sock, response, strlen(response));
+                xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
                 lin_send_wakeup(UART_NUM);
+                xSemaphoreGive(s_lin_tx_mutex);
                 vTaskDelay(pdMS_TO_TICKS(LIN_WAKEUP_WAIT_MS));
                 snprintf(response, sizeof(response), "# WAKE: slaves ready\r\n");
                 CMD_SEND(sock, response, strlen(response));
             }
-            if (lin_send_frame(UART_NUM, &frame) == ESP_OK) {
+            xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
+            esp_err_t snd_err = lin_send_frame(UART_NUM, &frame);
+            xSemaphoreGive(s_lin_tx_mutex);
+            if (snd_err == ESP_OK) {
                 led_indicator_send(LED_EVENT_LIN_TX);
                 output_frame(frame.id, frame.data, frame.len,
                               frame.checksum_type, esp_timer_get_time(), "TX");
@@ -838,7 +860,9 @@ void parse_command(char *cmd, int sock)
     else if (strcmp(cmd, "WAKE") == 0) {
         snprintf(response, sizeof(response), "# WAKE: sending wakeup pulse...\r\n");
         CMD_SEND(sock, response, strlen(response));
+        xSemaphoreTake(s_lin_tx_mutex, portMAX_DELAY);
         lin_send_wakeup(UART_NUM);
+        xSemaphoreGive(s_lin_tx_mutex);
         vTaskDelay(pdMS_TO_TICKS(LIN_WAKEUP_WAIT_MS));
         snprintf(response, sizeof(response), "# WAKE: slaves ready\r\n");
         CMD_SEND(sock, response, strlen(response));
@@ -1248,6 +1272,7 @@ void app_main(void)
     ESP_LOGI(TAG, "LIN Sniffer starting...");
 
     boot_timestamp_us = esp_timer_get_time();
+    s_lin_tx_mutex = xSemaphoreCreateMutex();
     ringbuf_init();
     led_indicator_init();
 
