@@ -6,6 +6,8 @@ idf_component_register(
         "led_indicator.c"
     INCLUDE_DIRS
         "."
+    EMBED_FILES
+        "app.html"
     REQUIRES
         lin_uart
         driver
