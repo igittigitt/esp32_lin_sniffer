@@ -76,6 +76,16 @@ static const char *TAG = "LIN_SNIFFER";
 #define NVS_NAMESPACE  "wifi_config"
 #define NVS_SSID_KEY   "ssid"
 #define NVS_PASS_KEY   "password"
+#define NVS_MODE_KEY   "force_ap"
+
+#if defined(CONFIG_IDF_TARGET_ESP32C6)
+    #define BOOT_BUTTON_GPIO  9
+#elif defined(CONFIG_IDF_TARGET_ESP32S3)
+    #define BOOT_BUTTON_GPIO  0
+#else
+    #define BOOT_BUTTON_GPIO  0
+#endif
+#define BOOT_BUTTON_HOLD_MS  3000
 
 #define UART_RX_TIMEOUT_SYMBOLS 10
 
@@ -356,6 +366,26 @@ bool wifi_set_credentials(const char *ssid, const char *password)
 
     nvs_close(nvs_handle);
     return success;
+}
+
+static bool wifi_mode_get_force_ap(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return false;
+    uint8_t val = 0;
+    nvs_get_u8(h, NVS_MODE_KEY, &val);
+    nvs_close(h);
+    return val != 0;
+}
+
+static bool wifi_mode_set_force_ap(bool force_ap)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return false;
+    bool ok = (nvs_set_u8(h, NVS_MODE_KEY, force_ap ? 1 : 0) == ESP_OK &&
+               nvs_commit(h) == ESP_OK);
+    nvs_close(h);
+    return ok;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -972,6 +1002,28 @@ void parse_command(char *cmd, int sock)
         CMD_SEND(sock, response, strlen(response));
     }
 
+    // WIFIMODE AP | WIFIMODE STA
+    else if (strncmp(cmd, "WIFIMODE ", 9) == 0) {
+        const char *mode_str = cmd + 9;
+        bool force_ap;
+        if (strcasecmp(mode_str, "AP") == 0) {
+            force_ap = true;
+        } else if (strcasecmp(mode_str, "STA") == 0) {
+            force_ap = false;
+        } else {
+            snprintf(response, sizeof(response), "# ERROR: WIFIMODE AP | WIFIMODE STA\r\n");
+            CMD_SEND(sock, response, strlen(response));
+            return;
+        }
+        wifi_mode_set_force_ap(force_ap);
+        snprintf(response, sizeof(response), "# OK: WiFi mode set to %s, rebooting...\r\n",
+                 force_ap ? "AP" : "STA");
+        CMD_SEND(sock, response, strlen(response));
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
+        return;
+    }
+
     // REBOOT
     else if (strcmp(cmd, "REBOOT") == 0) {
         snprintf(response, sizeof(response), "# Rebooting...\r\n");
@@ -1028,6 +1080,7 @@ void parse_command(char *cmd, int sock)
             "  STOP                         - Stop POLL/SEND/SLAVE/FILTER\r\n",
             "  SCAN                         - Scan all IDs 0x00-0x3F\r\n",
             "  WIFI <SSID> <PW>             - Set WiFi credentials and reboot\r\n",
+            "  WIFIMODE AP | WIFIMODE STA   - Switch WiFi mode and reboot\r\n",
             "  REBOOT                       - Restart device\r\n",
             "  IDENTIFY                     - Show device type, version and buses\r\n",
             "  HELP                         - Show this help\r\n",
@@ -1312,6 +1365,47 @@ void wifi_connect_sta(const char *ssid, const char *password)
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
+static void boot_button_task(void *pvParameters)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << BOOT_BUTTON_GPIO),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+
+    int held_ms = 0;
+    bool already_triggered = false;
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
+            // Button gedrückt (active low)
+            held_ms += 50;
+
+            if (!already_triggered && held_ms >= BOOT_BUTTON_HOLD_MS) {
+                already_triggered = true;
+                bool current = wifi_mode_get_force_ap();
+                bool new_mode = !current;
+                wifi_mode_set_force_ap(new_mode);
+                ESP_LOGW(TAG, "BOOT button: WiFi mode -> %s (rebooting...)",
+                         new_mode ? "AP" : "STA");
+                // Visuelles Feedback: kurzer Rot-Blitz
+                led_indicator_send(LED_EVENT_WIFI_ERROR);
+                vTaskDelay(pdMS_TO_TICKS(600));
+                esp_restart();
+            }
+        } else {
+            // Button losgelassen
+            held_ms = 0;
+            already_triggered = false;
+        }
+    }
+}
+
 void wifi_init(void)
 {
     char ssid[32]     = {0};
@@ -1345,6 +1439,12 @@ void wifi_init(void)
         }
     }
 
+    if (wifi_mode_get_force_ap()) {
+        ESP_LOGW(TAG, "Force-AP mode active (set via BOOT button or WIFIMODE command)");
+        wifi_start_ap();
+        return;
+    }
+
     if (!credentials_found) {
         wifi_start_ap();
         return;
@@ -1375,6 +1475,7 @@ void app_main(void)
     ESP_LOGI(TAG, "LIN UART ready");
 
     xTaskCreate(uart_event_task, "uart",  4096, NULL, 12, NULL);
+    xTaskCreate(boot_button_task, "boot_btn", 2048, NULL, 3, NULL);
 
     wifi_init();
 

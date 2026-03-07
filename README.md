@@ -9,6 +9,7 @@
 - Supports "Classic" (LIN 1.3) and "Enhanced" (LIN 2.x) LIN checksum calculation (auto-detect)
 - Adjustable baudrate (at compile time)
 - WIFI AccessPoint (AP-Mode) fallback for (initial) configuration, if Router is out of range or password-failure
+- Runtime WiFi mode toggle (STA ↔ AP) via BOOT button (hold 3 s) or `WIFIMODE` command
 - LED status indication
 - Web-Server terminal emulation
 - Accessible as Telnet terminal on Port 23
@@ -244,6 +245,26 @@ If WiFi connection fails after 10 retries, the device falls back to AP mode auto
 
 ---
 
+### `WIFIMODE AP | WIFIMODE STA`
+Switches the WiFi mode and reboots. The selected mode is stored in NVS and survives reboots.
+
+| Command | Effect |
+|---|---|
+| `WIFIMODE AP` | Forces AP mode on next boot (ignores stored credentials) |
+| `WIFIMODE STA` | Returns to STA mode (uses stored credentials, falls back to AP if none) |
+
+```
+WIFIMODE AP
+→ OK: WiFi mode set to AP, rebooting...
+
+WIFIMODE STA
+→ OK: WiFi mode set to STA, rebooting...
+```
+
+> **BOOT button shortcut:** Hold the BOOT button (GPIO9 on ESP32-C6) for **3 seconds** to toggle the mode directly on the device — no terminal needed. The LED flashes red briefly before the reboot.
+
+---
+
 ### `STATUS`
 Prints frame counters since last boot.
 
@@ -285,63 +306,12 @@ SLAVE 05 FF 00 00 00
 
 ---
 
-### `LOG CANDUMP | LOG HUMAN`
-Starts logging LIN bus traffic in the specified format. By default, **no logging is active** — frames are received but not output until you start logging.
-
-**CANDUMP format** — compatible with standard Linux candump tools:
-```
-LOG CANDUMP
-→ LOG started: CANDUMP format
-→ (1.500000) lin0 005#400B # RX Classic
-→ (1.600000) lin0 00D#CF1FC244 # RX Classic
-→ (1.700000) lin0 000# # UNANSWERED
-```
-
-**HUMAN format** — human-readable table:
-```
-LOG HUMAN
-→ LOG started: HUMAN format
-→ 05 | 40 0B                            CLA | @.       |
-→ 0D | CF 1F C2 44                      CLA | ....     |
-→ 00 | UNANSWERED                       --- | -------- |
-→ 2B | 03 31 30 43 36 37 39 00          CLA | .10C6790 |
-```
-
-Format columns:
-- **ID**: LIN frame ID (00-3F)
-- **Data Bytes**: Up to 8 data bytes in hex (24 chars wide)
-- **CRC**: `CLA` (Classic) or `ENH` (Enhanced), `---` for unanswered
-- **ASCII**: Printable characters or `.` for non-printable
-
-Use `STOP` to stop logging.
-
----
-
-### `STOP`
-Stops a running `POLL`, `SLAVE` simulation, or `FILTER` (or any combination if multiple are active).
-
-```
-STOP
-→ POLL stopped
-
-STOP
-→ SLAVE stopped
-
-STOP
-→ POLL and SLAVE and FILTER stopped
-
-STOP
-→ Nothing running
-```
-
----
-
 ### `HELP`
 Prints a one-line command summary.
 
 ```
 HELP
-→ HEADER <ID> | SEND <ID> <data> | POLL <ID> <ms> [<count>|<N>s] | SLAVE <ID> <data> | STOP | SCAN | WIFI <SSID> <PW> | STATUS | REBOOT | HELP
+→ HEADER <ID> | SEND <ID> <data> | POLL <ID> <ms> [<count>|<N>s] | SLAVE <ID> <data> | STOP | SCAN | WIFI <SSID> <PW> | WIFIMODE AP|STA | STATUS | REBOOT | HELP
 ```
 
 ---
