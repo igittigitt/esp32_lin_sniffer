@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AlfaXML Import Monitor</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg:       #0f1117;
+      --card:     #1a1d27;
+      --border:   #2c2f3e;
+      --accent:   #4f8ef7;
+      --green:    #22c55e;
+      --red:      #ef4444;
+      --orange:   #f97316;
+      --yellow:   #eab308;
+      --text:     #e2e8f0;
+      --muted:    #64748b;
+      --radius:   10px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      font-size: 14px;
+      min-height: 100vh;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 18px 28px;
+      background: var(--card);
+      border-bottom: 1px solid var(--border);
+    }
+    header h1 { font-size: 1.2rem; font-weight: 600; letter-spacing: .5px; }
+    #conn-badge {
+      display: flex; align-items: center; gap: 8px;
+      font-size: .8rem; color: var(--muted);
+    }
+    #conn-dot {
+      width: 9px; height: 9px; border-radius: 50%;
+      background: var(--muted); transition: background .3s;
+    }
+    #conn-dot.live { background: var(--green); box-shadow: 0 0 6px var(--green); }
+
+    main { padding: 24px 28px; display: flex; flex-direction: column; gap: 24px; }
+
+    /* Summary row */
+    .summary-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 16px;
+    }
+    .kpi-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px 20px;
+    }
+    .kpi-card .label { color: var(--muted); font-size: .75rem; text-transform: uppercase; letter-spacing: .8px; }
+    .kpi-card .value { font-size: 2rem; font-weight: 700; margin-top: 6px; }
+    .kpi-card .value.green  { color: var(--green); }
+    .kpi-card .value.red    { color: var(--red); }
+    .kpi-card .value.accent { color: var(--accent); }
+    .kpi-card .value.orange { color: var(--orange); }
+
+    /* Active imports */
+    .section-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .section-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border);
+      font-weight: 600;
+    }
+    .section-header .pill {
+      background: var(--accent);
+      color: #fff;
+      border-radius: 99px;
+      padding: 2px 10px;
+      font-size: .75rem;
+      font-weight: 700;
+    }
+    .pulse { animation: pulse 1.4s infinite; }
+    @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.4 } }
+
+    #active-list { padding: 12px 20px; min-height: 52px; }
+    .active-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 8px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .active-item:last-child { border-bottom: none; }
+    .spin {
+      width: 14px; height: 14px; border-radius: 50%;
+      border: 2px solid var(--accent);
+      border-top-color: transparent;
+      animation: spin .8s linear infinite; flex-shrink: 0;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .active-item .fname { flex: 1; font-family: monospace; font-size: .85rem; word-break: break-all; }
+    .active-item .since { color: var(--muted); font-size: .75rem; white-space: nowrap; }
+    .no-active { color: var(--muted); padding: 14px 0; text-align: center; }
+
+    /* Chart section */
+    .chart-controls {
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    }
+    .chart-controls label { color: var(--muted); font-size: .8rem; }
+    .chart-controls input[type=date] {
+      background: var(--bg); color: var(--text);
+      border: 1px solid var(--border); border-radius: 6px;
+      padding: 5px 10px; font-size: .85rem; cursor: pointer;
+    }
+    .chart-controls button {
+      background: var(--accent); color: #fff;
+      border: none; border-radius: 6px;
+      padding: 5px 14px; font-size: .85rem; cursor: pointer;
+    }
+    .chart-wrap { padding: 16px 20px 20px; }
+    #chart-container { position: relative; height: 220px; }
+
+    /* Legend */
+    .legend {
+      display: flex; gap: 18px; padding: 0 20px 14px; flex-wrap: wrap;
+    }
+    .legend-item { display: flex; align-items: center; gap: 6px; font-size: .8rem; }
+    .legend-dot { width: 10px; height: 10px; border-radius: 3px; }
+
+    /* Events table */
+    .events-wrap { overflow-x: auto; }
+    table {
+      width: 100%; border-collapse: collapse; font-size: .82rem;
+    }
+    th {
+      text-align: left; padding: 10px 16px;
+      color: var(--muted); font-weight: 600;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    td {
+      padding: 9px 16px;
+      border-bottom: 1px solid var(--border);
+      font-family: monospace;
+      word-break: break-all;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: rgba(255,255,255,.03); }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: .75rem; font-weight: 600; letter-spacing: .4px;
+    }
+    .badge.success    { background: rgba(34,197,94,.15); color: var(--green); }
+    .badge.rejected   { background: rgba(239,68,68,.15);  color: var(--red); }
+    .badge.failed     { background: rgba(239,68,68,.15);  color: var(--red); }
+    .badge.processing { background: rgba(79,142,247,.15); color: var(--accent); }
+
+    footer {
+      text-align: center; padding: 20px; color: var(--muted); font-size: .75rem;
+    }
+
+    @media (max-width: 600px) {
+      main { padding: 16px; }
+      header { padding: 14px 16px; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>AlfaXML Import Monitor</h1>
+  <div id="conn-badge">
+    <div id="conn-dot"></div>
+    <span id="conn-label">Verbinde…</span>
+  </div>
+</header>
+
+<main>
+
+  <!-- KPI row -->
+  <div class="summary-row">
+    <div class="kpi-card">
+      <div class="label">Aktiv</div>
+      <div class="value accent" id="kpi-active">—</div>
+    </div>
+    <div class="kpi-card">
+      <div class="label">Heute erfolgreich</div>
+      <div class="value green" id="kpi-success">—</div>
+    </div>
+    <div class="kpi-card">
+      <div class="label">Heute abgelehnt</div>
+      <div class="value red" id="kpi-rejected">—</div>
+    </div>
+    <div class="kpi-card">
+      <div class="label">Heute fehlgeschlagen</div>
+      <div class="value orange" id="kpi-failed">—</div>
+    </div>
+    <div class="kpi-card">
+      <div class="label">Gesamt heute</div>
+      <div class="value" id="kpi-total">—</div>
+    </div>
+  </div>
+
+  <!-- Active imports -->
+  <div class="section-card">
+    <div class="section-header">
+      <span>Aktive Importe <span class="pulse" id="active-spinner"></span></span>
+      <span class="pill" id="active-count">0</span>
+    </div>
+    <div id="active-list">
+      <div class="no-active">Keine aktiven Importe</div>
+    </div>
+  </div>
+
+  <!-- Statistics chart -->
+  <div class="section-card">
+    <div class="section-header">
+      <span>Importe nach Tageszeit (5-Minuten-Raster)</span>
+      <div class="chart-controls">
+        <label for="date-pick">Datum:</label>
+        <input type="date" id="date-pick" />
+        <button onclick="loadChart()">Laden</button>
+      </div>
+    </div>
+    <div class="legend">
+      <div class="legend-item"><div class="legend-dot" style="background:#22c55e"></div>Erfolgreich</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#ef4444"></div>Abgelehnt</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#f97316"></div>Fehlgeschlagen</div>
+    </div>
+    <div class="chart-wrap">
+      <div id="chart-container">
+        <canvas id="statsChart"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- Recent events -->
+  <div class="section-card">
+    <div class="section-header">
+      Letzte Ereignisse
+    </div>
+    <div class="events-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Datei</th>
+            <th>Status</th>
+            <th>Datum</th>
+            <th>Zeit</th>
+          </tr>
+        </thead>
+        <tbody id="events-body">
+          <tr><td colspan="4" style="text-align:center;color:var(--muted);padding:20px">Lade…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</main>
+
+<footer>AlfaXML Import Monitor — aktualisiert alle 2 Sekunden</footer>
+
+<script>
+// ── Utilities ─────────────────────────────────────────────────────────────
+function slotLabel(minutes) {
+  const h = String(Math.floor(minutes / 60)).padStart(2, '0');
+  const m = String(minutes % 60).padStart(2, '0');
+  return `${h}:${m}`;
+}
+
+function statusBadge(s) {
+  const map = {
+    success:    'Erfolgreich',
+    rejected:   'Abgelehnt',
+    failed:     'Fehler',
+    processing: 'Aktiv',
+  };
+  return `<span class="badge ${s}">${map[s] || s}</span>`;
+}
+
+function elapsed(isoStr) {
+  if (!isoStr) return '';
+  const diff = Math.floor((Date.now() - new Date(isoStr).getTime()) / 1000);
+  if (diff < 60) return `${diff}s`;
+  return `${Math.floor(diff/60)}m ${diff%60}s`;
+}
+
+// ── Chart setup ──────────────────────────────────────────────────────────
+const ctx = document.getElementById('statsChart').getContext('2d');
+const labels = [];
+for (let m = 0; m < 1440; m += 5) labels.push(slotLabel(m));
+
+const chart = new Chart(ctx, {
+  type: 'bar',
+  data: {
+    labels,
+    datasets: [
+      {
+        label: 'Erfolgreich',
+        data: new Array(288).fill(0),
+        backgroundColor: 'rgba(34,197,94,0.75)',
+        borderColor:     'rgba(34,197,94,1)',
+        borderWidth: 1,
+        stack: 'stack',
+      },
+      {
+        label: 'Abgelehnt',
+        data: new Array(288).fill(0),
+        backgroundColor: 'rgba(239,68,68,0.75)',
+        borderColor:     'rgba(239,68,68,1)',
+        borderWidth: 1,
+        stack: 'stack',
+      },
+      {
+        label: 'Fehlgeschlagen',
+        data: new Array(288).fill(0),
+        backgroundColor: 'rgba(249,115,22,0.75)',
+        borderColor:     'rgba(249,115,22,1)',
+        borderWidth: 1,
+        stack: 'stack',
+      },
+    ],
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: false,
+    interaction: { mode: 'index', intersect: false },
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        callbacks: {
+          title: (items) => `Zeit: ${items[0].label}`,
+        },
+      },
+    },
+    scales: {
+      x: {
+        grid: { color: 'rgba(255,255,255,.04)' },
+        ticks: {
+          color: '#64748b',
+          maxRotation: 0,
+          autoSkip: true,
+          maxTicksLimit: 25,  // show ~hourly labels
+        },
+      },
+      y: {
+        stacked: true,
+        beginAtZero: true,
+        grid: { color: 'rgba(255,255,255,.06)' },
+        ticks: { color: '#64748b', precision: 0 },
+      },
+    },
+  },
+});
+
+function updateChart(slots) {
+  const success = [], rejected = [], failed = [];
+  let total = 0;
+  for (const s of slots) {
+    success.push(s.success);
+    rejected.push(s.rejected);
+    failed.push(s.failed);
+    total += s.success + s.rejected + s.failed;
+  }
+  chart.data.datasets[0].data = success;
+  chart.data.datasets[1].data = rejected;
+  chart.data.datasets[2].data = failed;
+  chart.update('none');
+
+  // KPI totals
+  document.getElementById('kpi-success').textContent  = slots.reduce((a,s)=>a+s.success,0);
+  document.getElementById('kpi-rejected').textContent = slots.reduce((a,s)=>a+s.rejected,0);
+  document.getElementById('kpi-failed').textContent   = slots.reduce((a,s)=>a+s.failed,0);
+  document.getElementById('kpi-total').textContent    = total;
+}
+
+async function loadChart() {
+  const d = document.getElementById('date-pick').value;
+  const url = d ? `/api/stats/${d}` : '/api/stats/today';
+  const resp = await fetch(url);
+  const data = await resp.json();
+  updateChart(data.slots);
+}
+
+// Set today as default
+document.getElementById('date-pick').value = new Date().toISOString().slice(0,10);
+
+// ── Active imports renderer ───────────────────────────────────────────────
+function renderActive(active) {
+  document.getElementById('active-count').textContent = active.length;
+  document.getElementById('kpi-active').textContent   = active.length;
+
+  const el = document.getElementById('active-list');
+  if (active.length === 0) {
+    el.innerHTML = '<div class="no-active">Keine aktiven Importe</div>';
+    return;
+  }
+  el.innerHTML = active.map(a => `
+    <div class="active-item">
+      <div class="spin"></div>
+      <div class="fname">${escHtml(a.filename)}</div>
+      <div class="since">seit ${elapsed(a.started_at)}</div>
+    </div>
+  `).join('');
+}
+
+// ── Recent events renderer ────────────────────────────────────────────────
+function renderEvents(events) {
+  const tbody = document.getElementById('events-body');
+  if (!events || events.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:20px">Keine Ereignisse</td></tr>';
+    return;
+  }
+  tbody.innerHTML = events.map(e => `
+    <tr>
+      <td>${escHtml(e.filename)}</td>
+      <td>${statusBadge(e.status)}</td>
+      <td>${escHtml(e.log_date)}</td>
+      <td>${escHtml(e.log_time)}</td>
+    </tr>
+  `).join('');
+}
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+// ── WebSocket ─────────────────────────────────────────────────────────────
+let ws;
+let reconnectDelay = 1000;
+const connDot   = document.getElementById('conn-dot');
+const connLabel = document.getElementById('conn-label');
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+  ws.onopen = () => {
+    connDot.classList.add('live');
+    connLabel.textContent = 'Live';
+    reconnectDelay = 1000;
+  };
+
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    renderActive(msg.active || []);
+    if (msg.slots) updateChart(msg.slots);
+    if (msg.events) renderEvents(msg.events);
+  };
+
+  ws.onclose = () => {
+    connDot.classList.remove('live');
+    connLabel.textContent = `Reconnect in ${Math.round(reconnectDelay/1000)}s…`;
+    setTimeout(() => {
+      reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+      connect();
+    }, reconnectDelay);
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────
+connect();
+
+// Also poll recent events every 10s (not pushed via WS init only)
+async function refreshEvents() {
+  const resp  = await fetch('/api/events?limit=50');
+  const data  = await resp.json();
+  renderEvents(data.events);
+}
+setInterval(refreshEvents, 10000);
+refreshEvents();
+</script>
+
+</body>
+</html>

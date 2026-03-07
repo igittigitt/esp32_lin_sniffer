@@ -1,0 +1,30 @@
+services:
+  xml-import-monitor:
+    build: .
+    container_name: alfa-xml-monitor
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # Log file (read-only)
+      - /home/ngio/LogFile:/logs/LogFile:ro
+      # Watch directories (read-only)
+      - /home/ngio/Baskets/In/AlfaXmlImport/SafeDir:/watch/SafeDir:ro
+      - /home/ngio/Baskets/In/AlfaXmlImport/Rejected:/watch/Rejected:ro
+      # Persistent SQLite database
+      - alfa-monitor-data:/data
+    environment:
+      LOG_FILE: /logs/LogFile
+      SAFEDIR:  /watch/SafeDir
+      REJECTED: /watch/Rejected
+      DB_PATH:  /data/monitor.db
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/status')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  alfa-monitor-data:
+    driver: local
