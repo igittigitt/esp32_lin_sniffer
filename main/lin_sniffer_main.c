@@ -640,7 +640,7 @@ static void send_loop_stop(void)
 
 void parse_command(char *cmd, int sock)
 {
-    char response[256];
+    char response[512];
     char cmd_buf[256];
     
     // Copy to mutable buffer (cmd might be read-only)
@@ -1081,8 +1081,10 @@ void parse_command(char *cmd, int sock)
             "  SCAN                         - Scan all IDs 0x00-0x3F\r\n",
             "  WIFI <SSID> <PW>             - Set WiFi credentials and reboot\r\n",
             "  WIFIMODE AP | WIFIMODE STA   - Switch WiFi mode and reboot\r\n",
+            "  RSSI [DBM]                   - Show WiFi signal strength (bars or dBm)\r\n",
             "  REBOOT                       - Restart device\r\n",
             "  IDENTIFY                     - Show device type, version and buses\r\n",
+            "  PING                         - Check connection (responds with PONG + RSSI)\r\n",
             "  HELP                         - Show this help\r\n",
         };
         for (int i = 0; i < (int)(sizeof(help_lines) / sizeof(help_lines[0])); i++) {
@@ -1090,10 +1092,49 @@ void parse_command(char *cmd, int sock)
         }
     }
 
+    // PING
+    else if (strcmp(cmd, "PING") == 0) {
+        wifi_ap_record_t ap_info;
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+            snprintf(response, sizeof(response), "# PONG (%d dBm)\r\n", ap_info.rssi);
+        } else {
+            snprintf(response, sizeof(response), "# PONG (N/A)\r\n");
+        }
+        CMD_SEND(sock, response, strlen(response));
+    }
+
     // IDENTIFY
     else if (strcmp(cmd, "IDENTIFY") == 0) {
         snprintf(response, sizeof(response),
                  "# Type: LIN, Version: " LIN_SNIFFER_VERSION ", Buses: " LIN_BUS_NAMES "\r\n");
+        CMD_SEND(sock, response, strlen(response));
+    }
+
+    // RSSI [DBM]
+    else if (strcmp(cmd, "RSSI") == 0 || strncmp(cmd, "RSSI ", 5) == 0) {
+        bool dbm_only = (strncmp(cmd, "RSSI ", 5) == 0 && strcasecmp(cmd + 5, "DBM") == 0);
+        wifi_ap_record_t ap_info;
+        esp_err_t rssi_err = esp_wifi_sta_get_ap_info(&ap_info);
+        if (rssi_err == ESP_OK) {
+            int rssi = ap_info.rssi;
+            if (dbm_only) {
+                snprintf(response, sizeof(response), "# %d\r\n", rssi);
+            } else {
+                const char *bars;
+                if      (rssi >= -65) bars = "▂▄▆█";   // excellent
+                else if (rssi >= -75) bars = "▂▄▆░";   // good
+                else if (rssi >= -85) bars = "▂▄░░";   // fair
+                else                  bars = "▂░░░";   // poor
+                snprintf(response, sizeof(response), "%s (%d dBm)\r\n", bars, rssi);
+            }
+        } else {
+            // AP mode or not connected
+            if (dbm_only) {
+                snprintf(response, sizeof(response), "# N/A\r\n");
+            } else {
+                snprintf(response, sizeof(response), "░░░░ (N/A)\r\n");
+            }
+        }
         CMD_SEND(sock, response, strlen(response));
     }
 
