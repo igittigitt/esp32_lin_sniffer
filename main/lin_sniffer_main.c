@@ -676,7 +676,7 @@ void parse_command(char *cmd, int sock)
         if (hdr_err == ESP_OK) {
             led_indicator_send(LED_EVENT_LIN_TX);
             snprintf(response, sizeof(response),
-                     "HEADER sent for ID 0x%02X - watch for RX response\r\n", id);
+                     "# HEADER sent for ID 0x%02X - watch for RX response\r\n", id);
         } else {
             snprintf(response, sizeof(response), "# ERROR\r\n");
         }
@@ -831,7 +831,7 @@ void parse_command(char *cmd, int sock)
                             arg_id, arg_period, arg_limit, arg_wake);
         if (parsed < 2) {
             snprintf(response, sizeof(response),
-                     "ERROR: POLL <ID> <period_ms> [<count> | <N>s] [WAKE]\r\n");
+                     "# ERROR: POLL <ID> <period_ms> [<count> | <N>s] [WAKE]\r\n");
             CMD_SEND(sock, response, strlen(response));
         } else {
             uint8_t  id        = (uint8_t)strtol(arg_id, NULL, 16);
@@ -940,7 +940,7 @@ void parse_command(char *cmd, int sock)
                 slave_state.active   = true;
 
                 snprintf(response, sizeof(response),
-                         "SLAVE sim active: ID=0x%02X, %d byte(s)\r\n", id, len);
+                         "# SLAVE sim active: ID=0x%02X, %d byte(s)\r\n", id, len);
             }
             CMD_SEND(sock, response, strlen(response));
         }

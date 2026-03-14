@@ -74,6 +74,12 @@
     outline: none;
   }
   #cmd:focus { border-color: #007acc; }
+  #cmd:disabled {
+    background: #2a2a2a;
+    border-color: #3a3a3a;
+    color: #555;
+    cursor: not-allowed;
+  }
   button {
     background: #007acc;
     color: #fff;
@@ -85,6 +91,7 @@
   }
   button:hover  { background: #1a8ad4; }
   button:active { transform: scale(0.95); opacity: 0.8; }
+  button:disabled { background: #444; color: #666; cursor: not-allowed; }
   @keyframes pole {
     0%   { background-position: 0 0; }
     100% { background-position: 40px 0; }
@@ -122,16 +129,24 @@
 <div id="log"></div>
 
 <div id="inputbar">
-  <input id="cmd" type="text" placeholder="Command (e.g. HEADER 0E, SCAN, HELP)" autocomplete="off" spellcheck="false" autofocus />
-  <button onclick="sendCmd()">Send</button>
+  <input id="cmd" type="text" placeholder="Command (e.g. HEADER 0E, SCAN, HELP)" autocomplete="off" spellcheck="false" disabled />
+  <button id="sendbtn" onclick="sendCmd()" disabled>Send</button>
   <button onclick="clearLog()" style="background:#444">Clear</button>
   <button onclick="copyLog()" style="background:#444">Copy</button>
 </div>
 
 <script>
-const log    = document.getElementById('log');
-const status = document.getElementById('status');
+const log     = document.getElementById('log');
+const status  = document.getElementById('status');
 const connbtn = document.getElementById('connbtn');
+const cmdInput = document.getElementById('cmd');
+const sendbtn  = document.getElementById('sendbtn');
+
+function setInputEnabled(on) {
+  cmdInput.disabled = !on;
+  sendbtn.disabled  = !on;
+  if (on) cmdInput.focus();
+}
 
 let ws, autoScroll = true, pendingReload = false,
     cmdHistory = [], historyPos = -1, historyDraft = '';
@@ -184,6 +199,7 @@ function connect() {
     }
     status.className = 'ok';
     updBtn(true);
+    setInputEnabled(true);
   };
 
   ws.onmessage = e => {
@@ -193,6 +209,7 @@ function connect() {
   ws.onclose = () => {
     status.className = '';
     updBtn(false);
+    setInputEnabled(false);
     ws = null;
   };
 
@@ -203,6 +220,7 @@ function disconnect() {
   if (ws) { ws.close(); ws = null; }
   status.className = '';
   updBtn(false);
+  setInputEnabled(false);
   appendLine('# Getrennt', 'err');
 }
 
