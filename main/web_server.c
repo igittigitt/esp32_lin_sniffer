@@ -20,6 +20,7 @@
 #include "esp_partition.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -192,6 +193,19 @@ static esp_err_t handler_ws(httpd_req_t *req)
     if (req->method == HTTP_GET) {
         ESP_LOGI(TAG, "WS: Client connected fd=%d", fd);
         ws_client_add(fd);
+
+        char conn_msg[48];
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK)
+            snprintf(conn_msg, sizeof(conn_msg), "# Connected (RSSI: %d dBm)\r\n", ap.rssi);
+        else
+            snprintf(conn_msg, sizeof(conn_msg), "# Connected (RSSI: N/A)\r\n");
+        httpd_ws_frame_t conn_pkt = {
+            .type    = HTTPD_WS_TYPE_TEXT,
+            .payload = (uint8_t *)conn_msg,
+            .len     = strlen(conn_msg),
+        };
+        httpd_ws_send_frame(req, &conn_pkt);
 
         return ESP_OK;
     }
