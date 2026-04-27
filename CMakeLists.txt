@@ -18,8 +18,8 @@ add_custom_target(flash_image ALL
             -o "${CMAKE_CURRENT_SOURCE_DIR}/flash/esp32c6_esp32_lin_sniffer_merged.bin"
             0x0000 "${CMAKE_BINARY_DIR}/bootloader/bootloader.bin"
             0x8000 "${CMAKE_BINARY_DIR}/partition_table/partition-table.bin"
-            0xd000 "${CMAKE_BINARY_DIR}/ota_data_initial.bin"
-            0x10000 "${CMAKE_BINARY_DIR}/esp32_lin_sniffer.bin"
+            0xf000 "${CMAKE_BINARY_DIR}/ota_data_initial.bin"
+            0x20000 "${CMAKE_BINARY_DIR}/esp32_lin_sniffer.bin"
     COMMENT "Merging flash image -> flash/esp32c6_esp32_lin_sniffer_merged.bin"
     VERBATIM
 )
